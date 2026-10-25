@@ -26,7 +26,7 @@ a new library:
 
 ```bash
 mkdir acme_kicad_library && cd acme_kicad_library
-git init
+git init -b main
 kicad-part-importer --init --library-prefix acme_ \
     --library-mount '${KIPRJMOD}/acme_kicad_library'
 git add -A && git commit -m "New part library"
@@ -110,6 +110,14 @@ parts: Add components from ul_DEMOBUCK1.zip
 Describe the library for kicad-part-importer; fix 3D model paths
 Existing library
 ```
+
+Every command commits only the library files it wrote (`git add -- <files>`,
+`git commit -- <files>`), so work you have staged elsewhere stays out of the
+tool's commits. Files it changes in a project (the tables `--add-to-project`
+edits, the schematic `--migrate-schematic` rewrites) are never committed;
+commit them in the project. `--init` commits only with `--commit` on its own
+command line, so a `git_commit = true` template does not commit (or fail to)
+the moment a library is created.
 
 A dry run never commits, even with `--commit` or `git_commit = true`:
 
@@ -209,15 +217,15 @@ existing library; it only creates what is missing:
 ```text
 $ kicad-part-importer --init --library-prefix acme_ --model-dir models --model-search-dir vendor/SamacSys_Parts.3dshapes --library-mount '${KIPRJMOD}/acme_kicad_library'
 Library root: /tmp/demo/acme/acme_kicad_library
-Found 4 existing libraries named acme_*; they become the categories: c_74xx, connectors, ics, power
+Found 4 existing libraries named acme_*; they become the categories: connectors, c_74xx, ics, power
 ✓ Wrote kicad-part-importer.toml: prefix 'acme_', 4 categories, mount ${KIPRJMOD}/acme_kicad_library
 Initializing library files...
-  - Symbol library already exists: acme_74xx.kicad_sym
   - Symbol library already exists: acme_connectors.kicad_sym
+  - Symbol library already exists: acme_74xx.kicad_sym
   - Symbol library already exists: acme_ics.kicad_sym
   - Symbol library already exists: acme_power.kicad_sym
-  - Footprint directory already exists: acme_74xx.pretty
   - Footprint directory already exists: acme_connectors.pretty
+  - Footprint directory already exists: acme_74xx.pretty
   - Footprint directory already exists: acme_ics.pretty
   - Footprint directory already exists: acme_power.pretty
 ✓ Library initialization complete
@@ -244,11 +252,12 @@ stock_symbol_libraries = [
 ]
 
 [[categories]]
-key = "c_74xx"
-name = "acme_74xx"
+key = "connectors"
+description = "Connectors, headers, sockets, and interconnects"
 
 [[categories]]
-key = "connectors"
+key = "c_74xx"
+name = "acme_74xx"
 
 [[categories]]
 key = "ics"
@@ -257,6 +266,9 @@ key = "ics"
 key = "power"
 ```
 
+`acme_connectors` is one of the default categories (`connectors` with the
+`acme_` prefix), so it keeps that category's description and its place in
+the default menu order. The other libraries follow, sorted by name.
 `acme_74xx` cannot become the key `74xx`, because a key must not start with a
 digit, so it got the key `c_74xx` and keeps its library name. Rename the key
 (for example to `logic`), add descriptions and reorder the categories as you
@@ -288,12 +300,16 @@ someone adds the model. Once `--check-3d` exits 0, turn on the CI check.
 Other migration helpers:
 
 - `--migrate old_parts.kicad_sym` walks the symbols of another symbol
-  library, asks for each one's category, and copies the footprint it names
-  along.
+  library, asks for each one's category, and copies it there with the
+  footprint its Footprint field names (`old_footprints:SOT_DEMO` is looked
+  for in `lib_fp/old_footprints.pretty` first). The originals stay where they
+  are, and a symbol the category library already holds is not copied again.
 - `--migrate-schematic board.kicad_sch` finds the custom parts a schematic
   uses (skipping KiCad's stock libraries and libraries that already carry
   your prefix), copies them into the categories, and rewrites the
-  schematic's references (it keeps a `.kicad_sch.bak`).
+  schematic's references to the parts it copied (it keeps a
+  `.kicad_sch.bak`). A part it could not copy keeps its references, its
+  Footprint field included.
 - `--add-to-project` adds the categories to each project's tables, through
   the mount.
 
@@ -301,12 +317,17 @@ Other migration helpers:
 
 If the company keeps more than one library, keep one template config (for
 example in an internal tools repository) and seed each new library from it.
-The template's categories, prefix, mount and git settings become the new
-library's own file:
+Every setting the template names (categories, prefix, mount, `model_prefix`,
+`project_dir`, git settings) goes into the new library's own file:
 
 ```bash
 kicad-part-importer --init --library ~/kicad/new_lib --config ~/acme-tools/kicad-part-importer.toml
 ```
+
+The new folder is not a git repository yet, and `--init` commits only with
+`--commit` on its command line, so the template's `git_commit` / `git_push`
+take effect from the next command on. Run `git init -b main` in the new
+library and commit it yourself.
 
 ## What stays private
 

@@ -136,7 +136,8 @@ What each setting does, with an example value:
 **`library_prefix`**: the category libraries are named
 `<library_prefix><key>`. With `"acme_"` the category `power` lives in
 `lib_sym/acme_power.kicad_sym` and `lib_fp/acme_power.pretty`. `--check-3d`
-looks only at `<footprint_dir>/<library_prefix>*.pretty`, and
+looks at `<footprint_dir>/<library_prefix>*.pretty` plus the footprint
+library of every category whose `name` lacks the prefix, and
 `--migrate-schematic` treats any library with the prefix as already
 migrated. Library names cannot hold `/ \ : "`.
 
@@ -251,22 +252,30 @@ The 13 default categories:
 | 13 | `mechanicals_misc` | `lib_mechanicals_misc` | Mechanical parts, hardware, and miscellaneous components |
 
 `--init` in a folder that already holds `<prefix>*` libraries makes those
-the categories instead, one per library name. A name whose remainder is not a
-valid key keeps its name under a made-up key (`acme_74xx` becomes key
-`c_74xx`, name `acme_74xx`).
+the categories instead, one per library name. A library that is one of the
+default categories (`<prefix>connectors`, `<prefix>passives`, ...) keeps
+that category's key, description and place in the menu, so `--category N`
+still means the same category; the other libraries follow, sorted by name.
+A name whose remainder is not a valid key keeps its name under a made-up key
+(`acme_74xx` becomes key `c_74xx`, name `acme_74xx`).
 
 ## Git settings
 
 | Setting | Effect |
 |---|---|
-| `git_commit = true` | Commit after every command that writes, as if `--commit` were given. A planned import commits exactly the files it wrote; the other commands stage everything under the library root (`git add .`) |
+| `git_commit = true` | Commit after every command that writes, as if `--commit` were given: exactly the library files the command wrote (`git add -- <files>`, `git commit -- <files>`), never other changes you have staged |
 | `git_push = true` | Run `git push` afterwards, as if `--push` were given |
 | `git_message_prefix = "parts: "` | Put in front of every commit message the tool writes |
 
 `--no-commit` and `--no-push` switch them off for one run. `--dry-run`,
 `--check-3d` (with or without `--fix-3d`) and refused imports never commit
-or push. Without `git_push = true` or `--push`, the tool never runs
-`git push`.
+or push. Project files the tool edits (the tables `--add-to-project`
+changes, the schematic `--migrate-schematic` rewrites) are never committed.
+`--init` commits and pushes only with `--commit` / `--push` on its own
+command line: `git_commit` / `git_push` from a template, the new file or the
+environment do not apply to it. Without `git_push = true` or `--push`, the
+tool never runs `git push`. A requested commit or push that fails makes the
+run exit with code 1.
 
 ## Examples
 
@@ -339,11 +348,17 @@ project_dir = "../boards/board1"
 
 A company can keep one template file and seed every new library from it.
 `--init --config TEMPLATE` writes the template's settings into the new
-library's own file:
+library's own file. Every setting the template names is written as given,
+like a flag; `model_prefix` and `project_dir` included (a relative
+`project_dir` is relative to the template's folder and is rewritten relative
+to the new library):
 
 ```bash
 kicad-part-importer --init --library ~/kicad/new_lib --config ~/acme-template.toml
 ```
+
+The template's `git_commit` / `git_push` go into the new file but do not
+make `--init` itself commit (the new folder is not a repository yet).
 
 ## Validation
 

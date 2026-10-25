@@ -52,8 +52,11 @@ tool in a subprocess (`libtest_helpers.run_importer`) on a library made by
   indents; LF line endings (`.gitattributes` enforces this).
 - Keep the guarantees users rely on: a planned import decides every write
   before making one and refuses conflicts; `--dry-run` writes nothing;
-  `--json` keeps stdout to one JSON object; the tool never pushes unless told
-  to; files keep their line endings.
+  `--json` keeps stdout to one JSON object, usage errors included; a prompt
+  with no answer (stdin closed) exits 2, never with a traceback; a requested
+  action that fails exits 1; a commit holds only the library files the
+  command wrote; the tool never pushes unless told to; files keep their line
+  endings.
 - Nothing company- or library-specific in the code. Anything one library might
   want differently from another belongs in a setting
   ([docs/configuration.md](docs/configuration.md)).

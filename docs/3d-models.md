@@ -88,13 +88,14 @@ again. One with the same name and other bytes is refused unless you pass
 ## Checking the library: `--check-3d`
 
 `--check-3d` reads every footprint in the category footprint libraries
-(`<footprint_dir>/<library_prefix>*.pretty`, or every `.pretty` with
+(`<footprint_dir>/<library_prefix>*.pretty` plus the library of any category
+whose `name` lacks the prefix, or every `.pretty` with
 `--all-footprint-libs`) and classifies each `(model ...)` path:
 
 | Kind | Meaning | Fixable |
 |---|---|---|
-| `ok` | Library form, and the file exists with exactly that spelling | (nothing to fix) |
-| `case` | Library form, but the file's letter case differs. Loads on Windows and macOS, not on Linux | yes: the real spelling |
+| `ok` | Library form, and the file exists with exactly that spelling, folders included | (nothing to fix) |
+| `case` | Library form, but the letter case of the file name or of a folder in the path differs (`3D_Models/X.step` for `3d_models/X.step`). Loads on Windows and macOS, not on Linux | yes: the real spelling |
 | `missing` | Library form, no such file | no |
 | `bare` | A file name only; KiCad looks next to the project file | yes, if the file is in the model folder or a `model_search_dirs` folder |
 | `absolute` | `/...`, `X:/...` or `\\server\...`: machine-specific | same |
@@ -265,6 +266,22 @@ load, with `reason` (KiCad's message) and `body_loaded`. `body_loaded` is
 true when another `(model ...)` of the same footprint did load, so the part
 still has its body and the failing block is a dead extra reference.
 `verify_3d.no_body` lists the footprints that got no body at all.
+
+A footprint KiCad cannot load at all (a malformed or newer-format file) has
+no model to check, but it is a failure all the same: it is named, counted in
+the summary, listed in `verify_3d.load_errors`, and the exit code is 1, with
+`--check-3d` as with an import. Here the model paths are fine, one footprint
+is not:
+
+```text
+$ kicad-part-importer --check-3d --verify-3d
+Footprints checked: 2; model references: ok 2
+✗ KiCad could not load SOD_BROKEN.kicad_mod: FootprintLoad returned None
+3D check: 1 loaded, 0 with a model that did not load, 0 without a model, 1 that KiCad could not load (KiCad 10.0.7)
+```
+
+Open the footprint in KiCad's Footprint Editor to see why, and save it again
+or replace it.
 
 ### Requirements and how KiCad is found
 

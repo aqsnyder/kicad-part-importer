@@ -24,7 +24,10 @@ A KiCad project lists its own libraries in two files next to the
 `--add-to-project` adds the category libraries you pick to both. It writes
 each entry through the library mount and fills the description from the
 category. Entries whose name is already listed are left alone, so running it
-again is harmless. The tables must exist. A project gets them when you add a
+again is harmless. The tables are the project's files, so the tool never
+commits them (`--commit` does not apply); commit them in the project's own
+repository. The tables must exist (exit code 1 otherwise). A project gets
+them when you add a
 library on the *Project Specific Libraries* tab of *Preferences > Manage
 Symbol Libraries* (and *Manage Footprint Libraries*), or you can create them
 by hand:
@@ -209,4 +212,9 @@ later placement then picks the right footprint automatically.
 `--migrate-schematic` handles the other direction. For a schematic whose
 parts come from old project libraries, it copies the parts it can find into
 the categories and rewrites the schematic's `lib_id` and Footprint
-references to the category libraries, after saving a `.kicad_sch.bak`.
+references of the parts it copied to the category libraries, after saving a
+`.kicad_sch.bak`. A part whose symbol it could not read (its library is not
+in `sym-lib-table`, say), or whose name the category already has, keeps its
+references, its Footprint field included, even when it uses the same
+footprint as a part that was copied; a footprint it could not copy keeps
+its Footprint field. The schematic keeps its line endings.

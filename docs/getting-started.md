@@ -321,7 +321,14 @@ overwrites a footprint or model of the same name, and it appends a symbol
 even when one of that name exists. Prefer `--category ... --link-3d`. You
 can still answer the menu by leaving out `--yes`:
 `kicad-part-importer part.zip --link-3d` runs the planned import and shows
-the menu.
+the menu. Where nobody can answer it (a script, CI, stdin closed), a menu
+stops the run with exit code 2 before anything is written:
+
+```text
+$ kicad-part-importer ~/Downloads/LIB_DEMOCAP.zip --link-3d < /dev/null | tail -n 2
+Enter your choice (0-13):
+✗ no answer at the category menu (stdin closed); nothing written. Pass --category (one of: connectors, passives, semiconductors_discretes, ics_general, power_management, mcus_soc, memory_storage, rf_communication, sensors, optoelectronics_displays, electromechanical, protection, mechanicals_misc) and --yes to import without prompts
+```
 
 ## 4. Check the library
 

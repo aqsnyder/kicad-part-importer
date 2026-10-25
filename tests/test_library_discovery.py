@@ -242,6 +242,51 @@ class Init(ScratchDirCase):
                          [("ics", "acme_ics", "ICs"), ("power", "acme_power", "")])
         self.assertEqual(shown["git_message_prefix"], "lib: ")
 
+    def test_template_model_prefix_and_project_dir_are_kept(self):
+        # Every setting the template names is written as given, not commented out.
+        tpl_dir = self.t / "tpl"
+        tpl_dir.mkdir()
+        template = tpl_dir / "acme-template.json"
+        template.write_text(json.dumps({"library_prefix": "acme_", "model_prefix": "${ACME_MODELS}",
+                                        "project_dir": "boards/main"}), encoding="utf-8")
+        fmts = ("json", "toml") if HAVE_TOML else ("json",)
+        for fmt in fmts:
+            with self.subTest(fmt=fmt):
+                lib = tpl_dir / ("newlib_" + fmt)
+                r = H.run_importer("--init", "--library", lib, "--config", template, "--config-format", fmt)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                shown = self.show(cwd=lib)
+                self.assertEqual(shown["model_prefix"], "${ACME_MODELS}")
+                self.assertTrue(same_dir(shown["project_dir"], tpl_dir / "boards" / "main"))
+                self.assertEqual(shown["library_prefix"], "acme_")
+
+    def test_init_keeps_known_categories_with_their_descriptions_and_order(self):
+        # A library made with the default names (here by --init-libraries) keeps the
+        # default menu: same numbers for --category N, descriptions kept.
+        lib = self.t / "defaults"
+        (lib / "lib_sym").mkdir(parents=True)
+        r = H.run_importer("--library", lib, "--init-libraries")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        before = self.show("--library", lib)["categories"]
+        r = H.run_importer("--init", "--library", lib, "--config-format", "json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        after = self.show(cwd=lib)["categories"]
+        self.assertEqual(after, before)
+        self.assertEqual(after[4]["key"], "power_management")
+        self.assertTrue(all(c["description"] for c in after))
+
+    def test_init_appends_unknown_libraries_after_the_known_ones(self):
+        lib = self.t / "mixed"
+        (lib / "lib_sym").mkdir(parents=True)
+        for name in ("lib_zeta", "lib_passives", "lib_connectors", "lib_alpha"):
+            (lib / "lib_sym" / (name + ".kicad_sym")).write_text(H.EMPTY_LIB, encoding="utf-8")
+        r = H.run_importer("--init", "--library", lib, "--config-format", "json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        written = json.loads((lib / "kicad-part-importer.json").read_text(encoding="utf-8"))["categories"]
+        self.assertEqual([c["key"] for c in written], ["connectors", "passives", "alpha", "zeta"])
+        self.assertEqual(written[1]["description"], "Resistors, capacitors, inductors, and other passive components")
+        self.assertNotIn("description", written[2])
+
     def test_init_runs_alone(self):
         H.ti_zip(self.zips / "p.zip")
         r = H.run_importer("--init", "--library", self.t / "x", self.zips / "p.zip")

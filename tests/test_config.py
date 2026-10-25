@@ -341,6 +341,25 @@ class CustomLayoutCLI(ScratchDirCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("library_mount", r.stderr)
 
+    def test_check_3d_covers_a_category_named_without_the_prefix(self):
+        cfg = json.loads((self.lib / "kicad-part-importer.json").read_text(encoding="utf-8"))
+        cfg["categories"].append({"key": "logic", "name": "legacy_logic"})
+        (self.lib / "kicad-part-importer.json").write_text(json.dumps(cfg), encoding="utf-8")
+        H.run_importer("--library-root", self.lib, "--init-libraries")
+        H.samacsys_zip(self.zips / "s.zip")
+        r = H.run_importer("--library-root", self.lib, self.zips / "s.zip", "--category", "logic", "--yes")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue((self.lib / "footprints" / "legacy_logic.pretty" / "DIONTEST.kicad_mod").is_file())
+        # Imported without --link-3d: the bare model name is a problem the check must report.
+        r = H.run_importer("--library-root", self.lib, "--check-3d", "--json")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        rep = json.loads(r.stdout)
+        self.assertEqual((rep["footprints"], rep["counts"]), (1, {"bare": 1}))
+        # ... and the import's "also exists in" warning looks there too.
+        r = H.run_importer("--library-root", self.lib, self.zips / "s.zip", "--category", "protection",
+                           "--dry-run", "--json")
+        self.assertIn("footprint DIONTEST also exists in legacy_logic.pretty", json.loads(r.stdout)["warnings"])
+
 
 class ProjectTables(ScratchDirCase):
     def test_add_to_project_uses_the_project_dir(self):

@@ -36,10 +36,12 @@ model_search_dirs = []
 # The model path --link-3d writes. Default: <library_mount>/<model_dir>.
 # model_prefix = "${KIPRJMOD}/my_kicad_library/3d_models"
 
-# Git. git_commit = true commits after every command that writes (as if
-# --commit were given); git_push = true runs git push afterwards (as if
-# --push). --no-commit / --no-push override them for one run. --dry-run and
-# --check-3d never commit or push.
+# Git. git_commit = true commits the library files every command writes
+# (as if --commit were given); git_push = true runs git push afterwards
+# (as if --push). --no-commit / --no-push override them for one run.
+# --dry-run and --check-3d never commit or push, project files (the
+# tables --add-to-project edits) are never committed, and --init commits
+# or pushes only with --commit / --push on its command line.
 git_commit = false
 git_push = false
 # Put in front of every commit message the tool writes, e.g. "parts: ".

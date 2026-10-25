@@ -213,6 +213,46 @@ class NonInteractiveImport(Base):
         r = H.run_importer("--library-root", self.lib, "--migrate", "--yes")
         self.assertEqual(r.returncode, 2)
 
+    def test_non_utf8_vendor_files_are_a_plan_error(self):
+        # A symbol saved as cp1252 ("10 µF") and a footprint with a Latin-1 byte:
+        # refused with the JSON report, never a traceback.
+        z = self.zips / "latin1.zip"
+        with zipfile.ZipFile(z, "w") as zf:
+            zf.writestr("CAP/CAP.kicad_sym", H.SYMBOL.format(name="CAP10U", fp="CAP").replace(
+                '"CAP10U" (id 1)', '"10 µF" (id 1)').encode("cp1252"))
+            zf.writestr("CAP/CAP.kicad_mod",
+                        H.FP_UL.format(declared="CAP").replace("F.Fab", "F.Fab ü").encode("latin-1"))
+            zf.writestr("CAP/CAP.stp", H.FAKE_STEP)
+        before = H.snapshot(self.lib)
+        r = H.run_importer("--library-root", self.lib, z, "--category", "passives", "--link-3d", "--dry-run",
+                           "--json")
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        rep = json.loads(r.stdout)
+        self.assertFalse(rep["ok"])
+        self.assertIn("CAP/CAP.kicad_sym is not UTF-8 text", "\n".join(rep["errors"]))
+        self.assertIn("CAP/CAP.kicad_mod is not UTF-8 text", "\n".join(rep["errors"]))
+        self.assertEqual(H.snapshot(self.lib), before)
+
+    def test_non_utf8_library_file_is_a_plan_error(self):
+        # A category library of the library itself saved as cp1252 ("1 µH"): the plan
+        # reads every category's symbol names, so the import is refused with the
+        # JSON report (exit 3), never a traceback, whichever category it goes to.
+        H.ti_zip(self.zips / "p.zip")
+        lib_file = self.lib / "lib_sym" / "lib_passives.kicad_sym"
+        lib_file.write_bytes(H.SYMBOL.format(name="L1", fp="x").replace('"Value" "L1"', '"Value" "1 µH"')
+                             .encode("cp1252"))
+        before = H.snapshot(self.lib)
+        for mode in ("--dry-run", "--yes"):
+            r = H.run_importer("--library-root", self.lib, self.zips / "p.zip", "--category", "ics_general", mode,
+                               "--json")
+            self.assertEqual(r.returncode, 3, (mode, r.stderr))
+            self.assertNotIn("Traceback", r.stderr)
+            rep = json.loads(r.stdout)
+            self.assertFalse(rep["ok"])
+            self.assertIn("lib_sym/lib_passives.kicad_sym is not UTF-8 text", "\n".join(rep["errors"]))
+        self.assertEqual(H.snapshot(self.lib), before)
+
     def test_snapeda_zip_without_model(self):
         z = self.zips / "TESTREG1_7.zip"
         H.snapeda_zip(z)

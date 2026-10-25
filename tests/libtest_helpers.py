@@ -201,3 +201,85 @@ def make_step_with_kicad(kicad_cli, out_path):
         subprocess.run([kicad_cli, "pcb", "export", "step", "-f", "-o", str(out_path), pcb],
                        check=True, capture_output=True, timeout=300)
     return Path(out_path).read_bytes()
+
+
+def write_eol(path, text, eol="\n"):
+    """Write text (written with LF) to path with the given line ending, no translation."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text.replace("\n", eol))
+    return Path(path)
+
+
+# ----------------------------------------------------------------- migration
+# Tab-indented, as KiCad 7+ writes them (the migration commands need tabs).
+
+OLD_SYMBOL = (
+    '\t(symbol "{name}"\n'
+    '\t\t(pin_names\n\t\t\t(offset 0.254)\n\t\t)\n'
+    '\t\t(property "Reference" "U"\n\t\t\t(at 0 2.54 0)\n\t\t)\n'
+    '\t\t(property "Value" "{name}"\n\t\t\t(at 0 0 0)\n\t\t)\n'
+    '\t\t(property "Footprint" "{fp}"\n\t\t\t(at 0 0 0)\n\t\t)\n'
+    '\t\t(property "Datasheet" "https://example.com/{name}.pdf"\n\t\t\t(at 0 0 0)\n\t\t)\n'
+    '\t\t(symbol "{name}_0_1"\n'
+    '\t\t\t(rectangle\n\t\t\t\t(start -2.54 2.54)\n\t\t\t\t(end 2.54 -2.54)\n\t\t\t)\n'
+    '\t\t)\n'
+    '\t\t(symbol "{name}_1_1"\n'
+    '\t\t\t(pin passive line\n\t\t\t\t(at -5.08 0 0)\n\t\t\t\t(length 2.54)\n\t\t\t)\n'
+    '\t\t)\n'
+    '\t)\n'
+)
+
+
+def old_symbol_library(*symbols):
+    """A tab-indented symbol library holding OLD_SYMBOL blocks for (name, footprint field) pairs."""
+    body = "".join(OLD_SYMBOL.format(name=n, fp=fp) for n, fp in symbols)
+    return '(kicad_symbol_lib\n\t(version 20231120)\n\t(generator "kicad_symbol_editor")\n' + body + ')\n'
+
+
+def old_footprint(name, marker="original"):
+    """A small tab-indented footprint; marker tells two same-named copies apart."""
+    return ('(footprint "%s"\n\t(version 20240108)\n\t(generator "pcbnew")\n\t(layer "F.Cu")\n'
+            '\t(descr "%s")\n\t(pad "1" smd rect\n\t\t(at 0 0)\n\t\t(size 1 1)\n\t\t(layers "F.Cu")\n\t)\n)\n'
+            % (name, marker))
+
+
+SCHEMATIC_HEAD = ('(kicad_sch\n\t(version 20231120)\n\t(generator "eeschema")\n'
+                  '\t(uuid "00000000-0000-0000-0000-000000000001")\n\t(paper "A4")\n')
+
+
+def schematic(parts, embedded_footprints=False):
+    """A tab-indented schematic placing one instance of each (lib_id, footprint field).
+    With embedded_footprints, each lib_symbols entry carries the Footprint field
+    too, as KiCad's copies of the library symbols do."""
+    out = [SCHEMATIC_HEAD, "\t(lib_symbols\n"]
+    for lib_id, fp in parts:
+        field = '\t\t\t(property "Footprint" "%s"\n\t\t\t\t(at 0 0 0)\n\t\t\t)\n' % fp if embedded_footprints else ""
+        out.append('\t\t(symbol "%s"\n\t\t\t(property "Reference" "U"\n\t\t\t\t(at 0 0 0)\n\t\t\t)\n%s\t\t)\n'
+                   % (lib_id, field))
+    out.append("\t)\n")
+    for i, (lib_id, fp) in enumerate(parts, 1):
+        out.append('\t(symbol\n\t\t(lib_id "%s")\n\t\t(at %d 50 0)\n'
+                   '\t\t(property "Reference" "U%d"\n\t\t\t(at 0 0 0)\n\t\t)\n'
+                   '\t\t(property "Footprint" "%s"\n\t\t\t(at 0 0 0)\n\t\t)\n\t)\n' % (lib_id, 20 * i, i, fp))
+    out.append(")\n")
+    return "".join(out)
+
+
+def lib_table(kind, entries):
+    """A sym-lib-table / fp-lib-table text with (name, uri) entries."""
+    head = "sym_lib_table" if kind == "sym" else "fp_lib_table"
+    rows = "".join('  (lib (name "%s")(type "KiCad")(uri "%s")(options "")(descr ""))\n' % e for e in entries)
+    return "(%s\n  (version 7)\n%s)\n" % (head, rows)
+
+
+# --------------------------------------------------------------------- git
+
+GIT_ENV = {"GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "kpi-test", "GIT_COMMITTER_NAME": "Test",
+           "GIT_COMMITTER_EMAIL": "kpi-test", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def git(cwd, *args):
+    """Run git in cwd with a neutral identity and configuration; return its stdout."""
+    return subprocess.run(["git"] + [str(a) for a in args], cwd=cwd, env=clean_env(GIT_ENV), check=True,
+                          capture_output=True, text=True).stdout

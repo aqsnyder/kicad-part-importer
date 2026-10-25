@@ -25,8 +25,8 @@ Commands:
     --init                   Create a library here (or in --library DIR): config file + folders
     --init-libraries         Create the empty category libraries and folders (no config file)
     --add-to-project         Add libraries to a project's sym-lib-table / fp-lib-table
-    --migrate [FILE]         Move symbols from other .kicad_sym files into the categories
-    --migrate-schematic FILE Move the custom parts a schematic uses into the categories
+    --migrate [FILE]         Copy symbols from other .kicad_sym files into the categories
+    --migrate-schematic FILE Copy the custom parts a schematic uses into the categories
     --check-3d [--fix-3d]    Check (and fix) every footprint's 3D model path in the library
     --show-config            Print the effective settings as JSON
 
@@ -45,8 +45,8 @@ Configuration (see docs/configuration.md): --library DIR, --config FILE,
 import os
 import sys
 import re
-import glob
 import zipfile
+import zlib
 import shutil
 import argparse
 import subprocess
@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import tempfile
 import contextlib
+import traceback
 
 # The helper modules live next to this one; keep them importable under python -I too.
 _HERE = str(Path(__file__).resolve().parent)
@@ -70,6 +71,46 @@ EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_REFUSED = 0, 1, 2, 3
 EMPTY_SYMBOL_LIBRARY = '(kicad_symbol_lib (version 20211014) (generator kicad_symbol_editor)\n)'
 
 
+class NoAnswer(Exception):
+    """A prompt got no answer: stdin is closed (EOF) or the user pressed Ctrl+C."""
+
+    def __init__(self, why):
+        super().__init__(why)
+        self.why = why
+
+
+def _ask(prompt: str) -> str:
+    """input(), but a closed stdin or Ctrl+C raises NoAnswer instead of a traceback."""
+    try:
+        return input(prompt)
+    except EOFError:
+        print(flush=True)  # end the prompt's line before any message on stderr
+        raise NoAnswer("stdin closed") from None
+    except KeyboardInterrupt:
+        print(flush=True)
+        raise NoAnswer("interrupted") from None
+
+
+class ZipUnreadable(Exception):
+    """The input is not a readable zip archive: not a zip at all, truncated, or a
+    member that fails its CRC check or does not decompress."""
+
+
+def _extract_zip(zip_path, dest) -> None:
+    """Extract zip_path into dest. A file that is not a readable zip archive raises
+    ZipUnreadable, which every import path reports as a usage error (exit 2);
+    any other error (writing the files, say) propagates."""
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise ZipUnreadable(str(e)) from None
+    with zf:
+        try:
+            zf.extractall(dest)
+        except (zipfile.BadZipFile, zlib.error, EOFError) as e:
+            raise ZipUnreadable(str(e)) from None
+
+
 def _read_kicad_text(path):
     """Read a KiCad text file; return (text with LF line ends, the file's EOL)."""
     raw = lib3d.read_text(path)
@@ -81,6 +122,12 @@ def _write_kicad_text(path, text, eol='\n'):
     file keeps its line endings on Windows instead of turning into CRLF."""
     text = text.replace('\r\n', '\n')
     lib3d.write_text(path, text if eol == '\n' else text.replace('\n', eol))
+
+
+def _not_utf8(name, exc) -> str:
+    """The plan error for a file that is not UTF-8 text (KiCad writes UTF-8)."""
+    return ("%s is not UTF-8 text (byte 0x%02x at position %d); KiCad files are UTF-8: save it as UTF-8 "
+            "and try again" % (name, exc.object[exc.start], exc.start))
 
 
 def _top_level_symbol_names(text):
@@ -103,6 +150,36 @@ def _top_level_symbol_names(text):
             depth -= 1
         i += 1
     return names
+
+
+def _schematic_symbol_blocks(text):
+    """(start, end, lib_id) of every placed symbol of a .kicad_sch (a (symbol ...)
+    child of kicad_sch, by its (lib_id "...")) and of every (symbol "<lib_id>" ...)
+    entry of its lib_symbols section, in file order. String-aware and independent
+    of indentation."""
+    blocks, stack, i, n = [], [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+        elif c == '(':
+            m = re.match(r'\(\s*([^\s()"]+)', text[i:i + 80])
+            stack.append((i, m.group(1) if m else ''))
+        elif c == ')' and stack:
+            start, head = stack.pop()
+            m = None
+            if head == 'symbol':
+                parents = [h for _, h in stack]
+                if parents == ['kicad_sch']:
+                    m = re.search(r'\(lib_id\s+"((?:[^"\\]|\\.)*)"\s*\)', text[start:i])
+                elif parents == ['kicad_sch', 'lib_symbols']:
+                    m = re.match(r'\(symbol\s+"((?:[^"\\]|\\.)*)"', text[start:start + 300])
+            if m:
+                blocks.append((start, i + 1, m.group(1)))
+        i += 1
+    return sorted(blocks)
 
 
 def _guard_console_encoding():
@@ -142,10 +219,25 @@ class LibraryManager:
             c.key: {"name": c.name, "sym_file": c.sym_file, "fp_dir": c.fp_dir, "description": c.description}
             for c in config.categories
         }
+        # Files this run changed: library files (what commit_changes commits) and
+        # project files (tables, schematic), which the tool never commits.
+        self.written = set()
+        self.project_written = set()
+        self.git_ignored = []  # of the last commit's paths, those git ignores (left out of it)
+
+    def _record_write(self, path, project=False) -> None:
+        (self.project_written if project else self.written).add(Path(os.path.abspath(str(path))))
+
+    def _copy_file(self, src: Path, target: Path) -> None:
+        """Copy src to target (bytes as they are); record it unless target already held the same bytes."""
+        if target.is_file() and target.read_bytes() == Path(src).read_bytes():
+            return
+        shutil.copy2(src, target)
+        self._record_write(target)
 
     def _category_pretty_dirs(self):
-        """The category footprint libraries present: <footprint_dir>/<library_prefix>*.pretty."""
-        return sorted(self.lib_fp_path.glob(glob.escape(self.config.library_prefix) + '*.pretty'))
+        """The category footprint libraries present (see kicad_lib_3d.footprint_dirs)."""
+        return lib3d.footprint_dirs(self.config)
 
     def library_exists(self) -> bool:
         """True when the library root holds the symbol or the footprint folder,
@@ -180,10 +272,11 @@ class LibraryManager:
             print()
 
     def get_library_selection(self) -> Optional[str]:
-        """Get library selection from user. Returns None to skip, raises KeyboardInterrupt to stop."""
+        """Get library selection from user. Returns None to skip; raises NoAnswer when
+        stdin is closed or on Ctrl+C."""
         while True:
             try:
-                choice = input(f"\nEnter your choice (0-{len(self.libraries)}): ").strip()
+                choice = _ask(f"\nEnter your choice (0-{len(self.libraries)}): ").strip()
                 choice_num = int(choice)
 
                 if choice_num == 0:
@@ -194,29 +287,23 @@ class LibraryManager:
                     print(f"Invalid choice. Please enter a number between 0 and {len(self.libraries)}")
             except ValueError:
                 print("Invalid input. Please enter a number.")
-            # KeyboardInterrupt is NOT caught here - it propagates up to stop the loop
 
-    def extract_zip_contents(self, zip_path: str) -> Tuple[Path, List[str]]:
-        """Extract zip file and return temporary directory and file list"""
+    def extract_zip_contents(self, zip_path: str) -> Tuple[Path, List[Path]]:
+        """Extract the zip into a new temporary folder; return the folder and the
+        files in it. A file that is not a readable zip archive raises
+        ZipUnreadable; other errors propagate. The folder is removed when the
+        extraction fails."""
         temp_dir = Path(tempfile.mkdtemp())
-
         try:
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
-
-            # Get list of extracted files
-            extracted_files = []
-            for root, dirs, files in os.walk(temp_dir):
-                for file in files:
-                    extracted_files.append(Path(root) / file)
-
-            return temp_dir, extracted_files
-        except zipfile.BadZipFile:
-            print(f"Error: {zip_path} is not a valid zip file")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error extracting zip file: {e}")
-            sys.exit(1)
+            _extract_zip(zip_path, temp_dir)
+        except BaseException:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+        extracted_files = []
+        for root, dirs, files in os.walk(temp_dir):
+            for file in files:
+                extracted_files.append(Path(root) / file)
+        return temp_dir, extracted_files
 
     def categorize_files(self, files: List[Path]) -> Dict[str, List[Path]]:
         """Categorize files by type (symbols, footprints, 3d_models)"""
@@ -295,6 +382,7 @@ class LibraryManager:
 
             # Write the updated content (keeping the library file's line endings)
             _write_kicad_text(target_sym_file, updated_content, eol)
+            self._record_write(target_sym_file)
 
             print(f"✓ Added symbol(s) from {symbol_file.name} to {library_key}")
             return True
@@ -310,7 +398,7 @@ class LibraryManager:
             target_fp_dir.mkdir(parents=True, exist_ok=True)
 
             target_file = target_fp_dir / footprint_file.name
-            shutil.copy2(footprint_file, target_file)
+            self._copy_file(footprint_file, target_file)
 
             print(f"✓ Added footprint {footprint_file.name} to {library_key}")
             return True
@@ -323,7 +411,7 @@ class LibraryManager:
         """Add 3D model to the model folder"""
         try:
             target_file = self.models_3d_path / model_file.name
-            shutil.copy2(model_file, target_file)
+            self._copy_file(model_file, target_file)
 
             print(f"✓ Added 3D model {model_file.name}")
             return True
@@ -352,7 +440,7 @@ class LibraryManager:
         """Get project library selection from user"""
         while True:
             try:
-                choice = input(f"\nEnter your choice (0-{len(self.libraries)}, comma-separated for multiple): ").strip()
+                choice = _ask(f"\nEnter your choice (0-{len(self.libraries)}, comma-separated for multiple): ").strip()
 
                 if choice == "0":
                     return list(self.libraries.keys())
@@ -374,10 +462,10 @@ class LibraryManager:
 
             except ValueError:
                 print("Invalid input. Please enter numbers separated by commas.")
-            # KeyboardInterrupt is NOT caught here - it propagates up
 
     def update_project_settings(self) -> bool:
-        """Update project-specific library settings"""
+        """Update project-specific library settings. Raises NoAnswer when the
+        menu gets no answer."""
         try:
             # Look for sym-lib-table and fp-lib-table in the project folder
             # (default: the folder that holds the library root)
@@ -386,7 +474,8 @@ class LibraryManager:
             fp_lib_table = parent_dir / "fp-lib-table"
 
             if not sym_lib_table.exists() or not fp_lib_table.exists():
-                print("⚠ Project library tables not found. Skipping project integration.")
+                print(f"✗ Project library tables not found: {parent_dir} needs both sym-lib-table and "
+                      f"fp-lib-table (KiCad writes them; see docs/kicad-integration.md)")
                 return False
 
             # Display library selection menu
@@ -399,15 +488,18 @@ class LibraryManager:
 
             print(f"\nSelected libraries: {', '.join(selected_libraries)}")
 
-            # Add symbol libraries to sym-lib-table
-            self._update_sym_lib_table(sym_lib_table, selected_libraries)
-
-            # Add footprint libraries to fp-lib-table
-            self._update_fp_lib_table(fp_lib_table, selected_libraries)
+            # Add symbol libraries to sym-lib-table, footprint libraries to fp-lib-table
+            ok = self._update_sym_lib_table(sym_lib_table, selected_libraries)
+            ok = self._update_fp_lib_table(fp_lib_table, selected_libraries) and ok
+            if not ok:
+                print("✗ Could not update the project library tables")
+                return False
 
             print("✓ Updated project library settings")
             return True
 
+        except NoAnswer:
+            raise
         except Exception as e:
             print(f"✗ Error updating project settings: {e}")
             return False
@@ -424,12 +516,13 @@ class LibraryManager:
         """Library names already in a sym-lib-table / fp-lib-table."""
         return {m.replace('\\"', '"') for m in re.findall(r'\(lib\s+\(name\s+"((?:[^"\\]|\\.)*)"\)', table_content)}
 
-    def _update_lib_table(self, table: Path, selected_libraries: List[str], kind: str) -> None:
+    def _update_lib_table(self, table: Path, selected_libraries: List[str], kind: str) -> bool:
         """Add the selected category libraries to a project library table.
 
         kind is 'symbol' (sym-lib-table, <name>.kicad_sym) or 'footprint'
         (fp-lib-table, <name>.pretty). Libraries already listed by name are
-        left alone; new entries go before the table's closing parenthesis."""
+        left alone; new entries go before the table's closing parenthesis.
+        Returns False when the table could not be read or written."""
         is_sym = kind == 'symbol'
         try:
             table_content = ""
@@ -455,7 +548,7 @@ class LibraryManager:
 
             if not new_entries:
                 print(f"  - No new {kind} libraries to add")
-                return
+                return True
             if table_content.strip():
                 # Insert the new entries before the line that closes the table
                 lines = table_content.split('\n')
@@ -474,17 +567,20 @@ class LibraryManager:
                 text = f"({head}\n  (version 7)\n" + '\n'.join(new_entries) + "\n)\n"
             with open(table, 'w', encoding='utf-8', newline='') as f:
                 f.write(text.replace('\n', eol))
+            self._record_write(table, project=True)
             print(f"  ✓ Added {len(new_entries)} {kind} libraries to project")
+            return True
         except Exception as e:
             print(f"  ✗ Error updating {kind} library table: {e}")
+            return False
 
-    def _update_sym_lib_table(self, sym_lib_table: Path, selected_libraries: List[str]) -> None:
+    def _update_sym_lib_table(self, sym_lib_table: Path, selected_libraries: List[str]) -> bool:
         """Update symbol library table"""
-        self._update_lib_table(sym_lib_table, selected_libraries, 'symbol')
+        return self._update_lib_table(sym_lib_table, selected_libraries, 'symbol')
 
-    def _update_fp_lib_table(self, fp_lib_table: Path, selected_libraries: List[str]) -> None:
+    def _update_fp_lib_table(self, fp_lib_table: Path, selected_libraries: List[str]) -> bool:
         """Update footprint library table"""
-        self._update_lib_table(fp_lib_table, selected_libraries, 'footprint')
+        return self._update_lib_table(fp_lib_table, selected_libraries, 'footprint')
 
     def _git(self, *args):
         """Run one git command in the library root. Its output is captured and
@@ -499,27 +595,32 @@ class LibraryManager:
             raise subprocess.CalledProcessError(r.returncode, ['git'] + list(args))
         return r
 
+    def written_paths(self) -> List[str]:
+        """The library files this run changed, relative to the library root (POSIX), sorted."""
+        root = Path(os.path.abspath(str(self.base_path)))
+        out = []
+        for p in self.written:
+            try:
+                out.append(p.relative_to(root).as_posix())
+            except ValueError:  # outside the library root: not the library's to commit
+                pass
+        return sorted(out)
+
     def commit_changes(self, message: str) -> bool:
-        """Stage everything under the library root (`git add .`) and commit it
-        with ``message`` (after the configured git_message_prefix)."""
-        try:
-            # Stage all changes
-            self._git('add', '.')
-
-            commit_msg = self._commit_message(message)
-
-            # Commit changes
-            self._git('commit', '-m', commit_msg)
-
-            print(f"✓ Committed changes: {commit_msg}")
+        """Commit the library files this run wrote, and nothing else, with
+        ``message`` (after the configured git_message_prefix). Project files
+        (library tables, schematics) are never committed."""
+        paths = self.written_paths()
+        if not paths:
+            print("- Nothing to commit: this run changed no file in the library")
+            self._note_project_files()
             return True
+        return self.git_commit_paths(paths, message)
 
-        except subprocess.CalledProcessError as e:
-            print(f"✗ Error committing changes: {e}")
-            return False
-        except FileNotFoundError:
-            print("✗ Git not found. Please ensure git is installed and the directory is a git repository.")
-            return False
+    def _note_project_files(self) -> None:
+        if self.project_written:
+            names = ', '.join(sorted(str(p) for p in self.project_written))
+            print(f"- Not committed (project files; commit them in the project): {names}")
 
     def push_changes(self) -> bool:
         """Push changes to remote repository (only ever called for --push)"""
@@ -543,13 +644,13 @@ class LibraryManager:
             for folder in (self.lib_sym_path, self.lib_fp_path, self.models_3d_path):
                 folder.mkdir(parents=True, exist_ok=True)
 
-            # Initialize symbol libraries
+            # Initialize symbol libraries (LF line ends on every OS, as KiCad writes them)
             for lib_key, lib_info in self.libraries.items():
                 sym_file = self.lib_sym_path / lib_info['sym_file']
                 if not sym_file.exists():
                     # Create empty symbol library with proper structure
-                    with open(sym_file, 'w', encoding='utf-8') as f:
-                        f.write(EMPTY_SYMBOL_LIBRARY)
+                    _write_kicad_text(sym_file, EMPTY_SYMBOL_LIBRARY)
+                    self._record_write(sym_file)
                     print(f"  ✓ Created symbol library: {lib_info['sym_file']}")
                 else:
                     print(f"  - Symbol library already exists: {lib_info['sym_file']}")
@@ -586,7 +687,7 @@ class LibraryManager:
 
             while True:
                 try:
-                    choice = input("Delete the zip file? (y/n): ").strip().lower()
+                    choice = _ask("Delete the zip file? (y/n): ").strip().lower()
                     if choice in ['y', 'yes']:
                         zip_file.unlink()
                         print(f"✓ Deleted {zip_file.name}")
@@ -596,15 +697,18 @@ class LibraryManager:
                         break
                     else:
                         print("Please enter 'y' for yes or 'n' for no")
-                except KeyboardInterrupt:
-                    print(f"\n⚠ Keeping {zip_file.name}")
+                except NoAnswer as e:  # stdin closed or Ctrl+C: keep it, the safe answer
+                    print(f"⚠ No answer ({e.why}): kept {zip_file.name} (--keep-zip / --delete-zip decide "
+                          f"without asking)")
                     break
 
         except Exception as e:
             print(f"✗ Error handling zip file deletion: {e}")
 
     def extract_symbol_info(self, symbol_content: str) -> Dict[str, str]:
-        """Extract symbol information including datasheet and footprint"""
+        """Extract symbol information including datasheet and footprint. The name is
+        the block's own, from its first (symbol "..." line; the unit sub-symbols
+        that follow ("NAME_0_1", "NAME_1_1") are not the symbol's name."""
         info = {
             'name': '',
             'datasheet': '',
@@ -614,11 +718,11 @@ class LibraryManager:
 
         lines = symbol_content.split('\n')
         for i, line in enumerate(lines):
-            # Extract symbol name
+            # Extract symbol name (the first one: the top-level symbol)
             if line.strip().startswith('(symbol "'):
                 name_start = line.find('"') + 1
                 name_end = line.find('"', name_start)
-                if name_start > 0 and name_end > name_start:
+                if not info['name'] and name_start > 0 and name_end > name_start:
                     info['name'] = line[name_start:name_end]
 
             # Extract datasheet URL
@@ -652,24 +756,123 @@ class LibraryManager:
         return info
 
     def find_footprint_file(self, footprint_name: str) -> Optional[Path]:
-        """Find footprint file by name in existing footprint libraries"""
-        # Search in all existing footprint directories
-        for fp_dir in self.lib_fp_path.iterdir():
-            if fp_dir.is_dir() and fp_dir.name.endswith('.pretty'):
-                for fp_file in fp_dir.glob('*.kicad_mod'):
-                    if fp_file.stem == footprint_name:
-                        return fp_file
+        """Find the footprint a symbol's Footprint field names in the footprint folder.
+
+        The field is 'library:footprint' (or a bare footprint name). The footprint
+        is looked for in <library>.pretty first, then in every other .pretty."""
+        lib, sep, name = footprint_name.partition(':')
+        if not sep:
+            lib, name = '', footprint_name
+        if not name or not self.lib_fp_path.is_dir():
+            return None
+        fp_dirs = sorted(d for d in self.lib_fp_path.iterdir() if d.is_dir() and d.name.endswith('.pretty'))
+        fp_dirs.sort(key=lambda d: d.name != lib + '.pretty')  # the named library first
+        for fp_dir in fp_dirs:
+            for fp_file in sorted(fp_dir.glob('*.kicad_mod')):
+                if fp_file.stem == name:
+                    return fp_file
         return None
 
+    def _symbol_exists_in(self, name: str, library_key: str) -> bool:
+        """True when the category's symbol library already holds a symbol called name."""
+        p = self.lib_sym_path / self.libraries[library_key]['sym_file']
+        return p.exists() and name in _top_level_symbol_names(_read_kicad_text(p)[0])
+
+    def _migrate_symbol_blocks(self, symbols: List[str], counts: Dict[str, int]) -> None:
+        """Ask for each symbol's category and copy it there, with the footprint it
+        names. A symbol whose name the category library already has is not
+        copied again. Adds to counts['copied'] / counts['failed']; raises
+        NoAnswer when a prompt gets no answer."""
+        for symbol_content in symbols:
+            try:
+                symbol_info = self.extract_symbol_info(symbol_content)
+                name = symbol_info['name']
+
+                if not name:
+                    print("  ⚠ Skipping symbol - no name found")
+                    counts['failed'] += 1
+                    continue
+
+                # Display library selection menu
+                self.display_library_menu(name, symbol_info['datasheet'], symbol_info['footprint'])
+                selected_library = self.get_library_selection()
+
+                if selected_library is None:
+                    print(f"  - Skipping {name}")
+                    continue
+
+                if self._symbol_exists_in(name, selected_library):
+                    print(f"  ⚠ {name} already exists in {self.libraries[selected_library]['name']}; not copied "
+                          f"again (remove or rename one of them first)")
+                    counts['failed'] += 1
+                    continue
+
+                # Add symbol to selected library
+                if not self.add_symbol_to_library_direct(symbol_content, selected_library):
+                    print(f"  ✗ Failed to add {name}")
+                    counts['failed'] += 1
+                    continue
+                print(f"  ✓ Added {name} to {selected_library}")
+                counts['copied'] += 1
+
+                # Handle footprint if specified
+                if symbol_info['footprint'] and not self.migrate_footprint(symbol_info['footprint'],
+                                                                           selected_library):
+                    counts['failed'] += 1
+
+            except NoAnswer:
+                raise
+            except KeyboardInterrupt:
+                raise NoAnswer("interrupted") from None
+            except Exception as e:
+                print(f"  ✗ Error processing symbol: {e}")
+                counts['failed'] += 1
+
+    def _migrate_symbol_file(self, source_file: Path, counts: Dict[str, int]) -> bool:
+        """Migrate the symbols of one .kicad_sym; False when it cannot be read as one."""
+        try:
+            with open(source_file, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"  ✗ Cannot read {source_file.name}: {e}")
+            return False
+
+        if not content.startswith('(kicad_symbol_lib'):
+            print(f"  ⚠ Skipping {source_file.name} - not a valid symbol library")
+            return False
+
+        # Extract individual symbols
+        symbols = self.extract_symbols_from_library(content)
+
+        if not symbols:
+            print(f"  - No symbols found in {source_file.name}")
+            return True
+
+        print(f"  Found {len(symbols)} symbol(s)")
+        self._migrate_symbol_blocks(symbols, counts)
+        return True
+
+    @staticmethod
+    def _print_migration_summary(counts: Dict[str, int], stop: Optional[NoAnswer] = None) -> None:
+        print("\n" + "="*60)
+        print("Migration Complete" if stop is None else f"Migration stopped: no answer at the prompt ({stop.why})")
+        print("="*60)
+        print(f"✓ Migrated {counts['copied']} symbol(s)")
+        if counts['failed']:
+            print(f"✗ {counts['failed']} symbol(s) or footprint(s) not copied (see above)")
+
     def migrate_symbols(self) -> bool:
-        """Migrate symbols from existing .kicad_sym files to categorized libraries"""
-        migrated_count = 0
+        """Migrate symbols from existing .kicad_sym files to categorized libraries.
+
+        Returns False when a file or symbol could not be migrated; raises NoAnswer
+        (after the summary) when a prompt gets no answer."""
+        counts = {'copied': 0, 'failed': 0}
         try:
             print("Symbol Migration Tool")
             print("="*60)
 
             # Find all .kicad_sym files in the symbol directory
-            sym_files = list(self.lib_sym_path.glob('*.kicad_sym'))
+            sym_files = sorted(self.lib_sym_path.glob('*.kicad_sym'))
 
             # Filter out the new categorized libraries
             exclude_files = {lib_info['sym_file'] for lib_info in self.libraries.values()}
@@ -683,90 +886,29 @@ class LibraryManager:
             for i, file in enumerate(source_files, 1):
                 print(f"  {i}. {file.name}")
 
+            ok = True
             for source_file in source_files:
-                try:
-                    print("\n" + "="*60)
-                    print(f"Processing: {source_file.name}")
-                    print("="*60)
+                print("\n" + "="*60)
+                print(f"Processing: {source_file.name}")
+                print("="*60)
+                ok = self._migrate_symbol_file(source_file, counts) and ok
 
-                    # Read and parse the source file
-                    with open(source_file, 'r', encoding='utf-8') as f:
-                        content = f.read().strip()
+            self._print_migration_summary(counts)
+            return ok and not counts['failed']
 
-                    if not content.startswith('(kicad_symbol_lib'):
-                        print(f"  ⚠ Skipping {source_file.name} - not a valid symbol library")
-                        continue
-
-                    # Extract individual symbols
-                    symbols = self.extract_symbols_from_library(content)
-
-                    if not symbols:
-                        print(f"  - No symbols found in {source_file.name}")
-                        continue
-
-                    print(f"  Found {len(symbols)} symbol(s)")
-
-                    # Process each symbol
-                    for symbol_content in symbols:
-                        try:
-                            symbol_info = self.extract_symbol_info(symbol_content)
-
-                            if not symbol_info['name']:
-                                print("  ⚠ Skipping symbol - no name found")
-                                continue
-
-                            # Display library selection menu
-                            self.display_library_menu(symbol_info['name'], symbol_info['datasheet'], symbol_info['footprint'])
-                            selected_library = self.get_library_selection()
-
-                            if selected_library is None:
-                                print(f"  - Skipping {symbol_info['name']}")
-                                continue
-
-                            # Add symbol to selected library
-                            if self.add_symbol_to_library_direct(symbol_content, selected_library):
-                                print(f"  ✓ Added {symbol_info['name']} to {selected_library}")
-
-                                # Handle footprint if specified
-                                if symbol_info['footprint']:
-                                    self.migrate_footprint(symbol_info['footprint'], selected_library)
-
-                                migrated_count += 1
-                            else:
-                                print(f"  ✗ Failed to add {symbol_info['name']}")
-
-                        except KeyboardInterrupt:
-                            print("\n\n⚠ Stopping migration (Ctrl+C)")
-                            raise  # Re-raise to break out of file loop
-                        except Exception as e:
-                            print(f"  ✗ Error processing symbol: {e}")
-                            continue
-
-                except KeyboardInterrupt:
-                    print("  Finished processing current file, stopping...")
-                    break  # Break out of files loop
-                except Exception as e:
-                    print(f"  ✗ Error processing file {source_file.name}: {e}")
-                    continue
-
-            print("\n" + "="*60)
-            print("Migration Complete")
-            print("="*60)
-            print(f"✓ Migrated {migrated_count} symbol(s)")
-
-            return True
-
-        except KeyboardInterrupt:
-            print("\n⚠ Migration interrupted by user")
-            print(f"✓ Migrated {migrated_count} symbol(s) before interruption")
-            return True
+        except NoAnswer as e:
+            self._print_migration_summary(counts, e)
+            raise
         except Exception as e:
             print(f"✗ Error during migration: {e}")
             return False
 
     def migrate_single_file(self, file_path: str) -> bool:
-        """Migrate symbols from a single .kicad_sym file"""
-        migrated_count = 0
+        """Migrate symbols from a single .kicad_sym file.
+
+        Returns False when the file or a symbol could not be migrated; raises
+        NoAnswer (after the summary) when a prompt gets no answer."""
+        counts = {'copied': 0, 'failed': 0}
         try:
             file_path = Path(file_path)
 
@@ -783,70 +925,13 @@ class LibraryManager:
             print(f"Processing: {file_path.name}")
             print("="*60)
 
-            # Read and parse the source file
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
+            ok = self._migrate_symbol_file(file_path, counts)
+            self._print_migration_summary(counts)
+            return ok and not counts['failed']
 
-            if not content.startswith('(kicad_symbol_lib'):
-                print(f"  ⚠ Skipping {file_path.name} - not a valid symbol library")
-                return False
-
-            # Extract individual symbols
-            symbols = self.extract_symbols_from_library(content)
-
-            if not symbols:
-                print(f"  - No symbols found in {file_path.name}")
-                return True
-
-            print(f"  Found {len(symbols)} symbol(s)")
-
-            # Process each symbol
-            for symbol_content in symbols:
-                try:
-                    symbol_info = self.extract_symbol_info(symbol_content)
-
-                    if not symbol_info['name']:
-                        print("  ⚠ Skipping symbol - no name found")
-                        continue
-
-                    # Display library selection menu
-                    self.display_library_menu(symbol_info['name'], symbol_info['datasheet'], symbol_info['footprint'])
-                    selected_library = self.get_library_selection()
-
-                    if selected_library is None:
-                        print(f"  - Skipping {symbol_info['name']}")
-                        continue
-
-                    # Add symbol to selected library
-                    if self.add_symbol_to_library_direct(symbol_content, selected_library):
-                        print(f"  ✓ Added {symbol_info['name']} to {selected_library}")
-
-                        # Handle footprint if specified
-                        if symbol_info['footprint']:
-                            self.migrate_footprint(symbol_info['footprint'], selected_library)
-
-                        migrated_count += 1
-                    else:
-                        print(f"  ✗ Failed to add {symbol_info['name']}")
-
-                except KeyboardInterrupt:
-                    print("\n\n⚠ Stopping migration (Ctrl+C)")
-                    break  # Break out of symbols loop
-                except Exception as e:
-                    print(f"  ✗ Error processing symbol: {e}")
-                    continue
-
-            print("\n" + "="*60)
-            print("Migration Complete")
-            print("="*60)
-            print(f"✓ Migrated {migrated_count} symbol(s)")
-
-            return True
-
-        except KeyboardInterrupt:
-            print("\n⚠ Migration interrupted by user")
-            print(f"✓ Migrated {migrated_count} symbol(s) before interruption")
-            return True
+        except NoAnswer as e:
+            self._print_migration_summary(counts, e)
+            raise
         except Exception as e:
             print(f"✗ Error during migration: {e}")
             return False
@@ -923,6 +1008,7 @@ class LibraryManager:
 
             # Write the updated content (keeping the library file's line endings)
             _write_kicad_text(target_sym_file, updated_content, eol)
+            self._record_write(target_sym_file)
 
             return True
 
@@ -930,27 +1016,34 @@ class LibraryManager:
             print(f"  ✗ Error adding symbol: {e}")
             return False
 
-    def migrate_footprint(self, footprint_name: str, library_key: str) -> None:
-        """Migrate footprint to the appropriate library directory"""
+    def migrate_footprint(self, footprint_name: str, library_key: str) -> bool:
+        """Copy the footprint a symbol's Footprint field names into the category's
+        footprint library. A footprint that is not in the footprint folder (a stock
+        KiCad one, say) is reported and left alone. False only when the copy failed."""
         try:
             # Find the footprint file
             footprint_file = self.find_footprint_file(footprint_name)
 
             if not footprint_file:
-                print(f"    ⚠ Footprint {footprint_name} not found")
-                return
+                print(f"    ⚠ Footprint {footprint_name} not found in {self.config.footprint_dir}/; not copied")
+                return True
 
-            # Copy to target library directory
+            # Copy to target library directory (the original stays where it is)
             target_fp_dir = self.lib_fp_path / self.libraries[library_key]['fp_dir']
             target_fp_dir.mkdir(parents=True, exist_ok=True)
 
             target_file = target_fp_dir / footprint_file.name
-            shutil.copy2(footprint_file, target_file)
+            if footprint_file.parent.resolve() == target_fp_dir.resolve():
+                print(f"    - Footprint {footprint_file.stem} is already in {library_key}")
+                return True
+            self._copy_file(footprint_file, target_file)
 
-            print(f"    ✓ Moved footprint {footprint_name} to {library_key}")
+            print(f"    ✓ Copied footprint {footprint_file.stem} to {library_key}")
+            return True
 
         except Exception as e:
-            print(f"    ✗ Error migrating footprint {footprint_name}: {e}")
+            print(f"    ✗ Error copying footprint {footprint_name}: {e}")
+            return False
 
     def parse_lib_table(self, lib_table_path: Path) -> Dict[str, str]:
         """Parse a lib-table file and return mapping of library name to URI"""
@@ -1043,7 +1136,6 @@ class LibraryManager:
 
         except Exception as e:
             print(f"Error extracting components from {schematic_path}: {e}")
-            import traceback
             traceback.print_exc()
             return []
 
@@ -1108,7 +1200,8 @@ class LibraryManager:
             return None
 
     def read_footprint_from_library(self, fp_lib_path: Path, footprint_name: str) -> Optional[Tuple[str, Path]]:
-        """Read a specific footprint from a footprint library directory"""
+        """Read a specific footprint from a footprint library directory (as it is,
+        line endings included)"""
         try:
             if not fp_lib_path.exists():
                 return None
@@ -1116,14 +1209,12 @@ class LibraryManager:
             # Footprint libraries are directories with .kicad_mod files
             fp_file = fp_lib_path / f"{footprint_name}.kicad_mod"
             if fp_file.exists():
-                with open(fp_file, 'r', encoding='utf-8') as f:
-                    return f.read(), fp_file
+                return lib3d.read_text(fp_file), fp_file
 
             # Try to find footprint with different naming
             for mod_file in fp_lib_path.glob('*.kicad_mod'):
                 if mod_file.stem == footprint_name:
-                    with open(mod_file, 'r', encoding='utf-8') as f:
-                        return f.read(), mod_file
+                    return lib3d.read_text(mod_file), mod_file
 
             return None
 
@@ -1145,9 +1236,18 @@ class LibraryManager:
         ]
 
     def migrate_schematic(self, schematic_path: str) -> bool:
-        """Migrate symbols and footprints from a schematic to categorized libraries"""
+        """Migrate symbols and footprints from a schematic to categorized libraries.
+
+        Only a part whose symbol was copied is pointed at its category library; a
+        part whose symbol could not be read, or that the category already holds,
+        keeps its references, and a footprint that could not be copied keeps its
+        Footprint field. Returns False when a part could not be migrated; raises
+        NoAnswer (after updating the schematic for the parts already copied)
+        when a prompt gets no answer."""
         migrations = []
         migrated_count = 0
+        failed = 0
+        stop = None
         try:
             schematic_path = Path(schematic_path)
 
@@ -1217,14 +1317,21 @@ class LibraryManager:
                     print(f"Component: {lib_id}")
                     print("-"*60)
 
-                    # Get symbol library path
+                    # The symbol must be readable before anything is asked or written
                     sym_uri = sym_lib_map.get(lib_name, '')
-                    if sym_uri:
-                        sym_lib_path = self.resolve_library_path(sym_uri, project_dir)
-                        print(f"  Symbol library: {sym_lib_path}")
-                    else:
-                        print(f"  ⚠ Symbol library '{lib_name}' not found in sym-lib-table")
-                        sym_lib_path = None
+                    if not sym_uri:
+                        print(f"  ⚠ Symbol library '{lib_name}' not found in sym-lib-table; skipped "
+                              f"(the schematic keeps {lib_id})")
+                        failed += 1
+                        continue
+                    sym_lib_path = self.resolve_library_path(sym_uri, project_dir)
+                    print(f"  Symbol library: {sym_lib_path}")
+                    symbol_content = self.read_symbol_from_library(sym_lib_path, sym_name)
+                    if not symbol_content:
+                        print(f"  ⚠ Could not read symbol {sym_name} from {sym_lib_path}; skipped "
+                              f"(the schematic keeps {lib_id})")
+                        failed += 1
+                        continue
 
                     # Get footprint library path
                     fp_lib_name = ''
@@ -1242,7 +1349,8 @@ class LibraryManager:
                         print(f"  Footprint: {fp_name}")
                     else:
                         if fp_lib_name:
-                            print(f"  ⚠ Footprint library '{fp_lib_name}' not found in fp-lib-table")
+                            print(f"  ⚠ Footprint library '{fp_lib_name}' not found in fp-lib-table; the "
+                                  f"Footprint field stays {footprint}")
                         fp_lib_path = None
 
                     # Display library selection menu
@@ -1253,19 +1361,22 @@ class LibraryManager:
                         print(f"  - Skipping {sym_name}")
                         continue
 
-                    # Migrate symbol
-                    if sym_lib_path and sym_lib_path.exists():
-                        symbol_content = self.read_symbol_from_library(sym_lib_path, sym_name)
-                        if symbol_content:
-                            if self.add_symbol_to_library_direct(symbol_content, selected_library):
-                                print(f"  ✓ Migrated symbol {sym_name} to {selected_library}")
-                            else:
-                                print(f"  ✗ Failed to migrate symbol {sym_name}")
-                        else:
-                            print(f"  ⚠ Could not read symbol {sym_name} from source library")
+                    # Migrate symbol (never a second symbol of one name in a library)
+                    if self._symbol_exists_in(sym_name, selected_library):
+                        print(f"  ⚠ {sym_name} already exists in {self.libraries[selected_library]['name']}; "
+                              f"not copied, and the schematic keeps {lib_id} (remove or rename one of them first)")
+                        failed += 1
+                        continue
+                    if not self.add_symbol_to_library_direct(symbol_content, selected_library):
+                        print(f"  ✗ Failed to migrate symbol {sym_name}; the schematic keeps {lib_id}")
+                        failed += 1
+                        continue
+                    print(f"  ✓ Migrated symbol {sym_name} to {selected_library}")
 
-                    # Migrate footprint
-                    if fp_lib_path and fp_lib_path.exists() and fp_name:
+                    # Migrate footprint (only a copied one gets the new Footprint field)
+                    new_fp_lib = self.libraries[selected_library]['fp_dir'].replace('.pretty', '')
+                    new_footprint = ''
+                    if fp_lib_path and fp_name:
                         fp_result = self.read_footprint_from_library(fp_lib_path, fp_name)
                         if fp_result:
                             fp_content, fp_source = fp_result
@@ -1273,91 +1384,108 @@ class LibraryManager:
                             target_fp_dir.mkdir(parents=True, exist_ok=True)
                             target_fp_file = target_fp_dir / f"{fp_name}.kicad_mod"
 
-                            with open(target_fp_file, 'w', encoding='utf-8') as f:
-                                f.write(fp_content)
+                            lib3d.write_text(target_fp_file, fp_content)  # as it was, line endings included
+                            self._record_write(target_fp_file)
+                            new_footprint = f"{new_fp_lib}:{fp_name}"
 
                             print(f"  ✓ Migrated footprint {fp_name} to {selected_library}")
                         else:
-                            print(f"  ⚠ Could not read footprint {fp_name} from source library")
+                            print(f"  ⚠ Could not read footprint {fp_name} from {fp_lib_path}; the Footprint "
+                                  f"field stays {footprint}")
+                            failed += 1
 
                     # Record migration for schematic update
                     new_sym_lib = self.libraries[selected_library]['sym_file'].replace('.kicad_sym', '')
-                    new_fp_lib = self.libraries[selected_library]['fp_dir'].replace('.pretty', '')
 
                     migrations.append({
                         'old_lib_id': lib_id,
                         'new_lib_id': f"{new_sym_lib}:{sym_name}",
                         'old_footprint': footprint,
-                        'new_footprint': f"{new_fp_lib}:{fp_name}" if fp_name else ''
+                        'new_footprint': new_footprint
                     })
 
                     migrated_count += 1
 
+                except NoAnswer as e:
+                    stop = e
+                    break  # Stop asking; update the schematic with the completed migrations
                 except KeyboardInterrupt:
-                    print("\n\n⚠ Stopping migration (Ctrl+C) - will update schematic with completed migrations...")
-                    break  # Break out of component loop, continue to update schematic
+                    stop = NoAnswer("interrupted")
+                    break
                 except Exception as e:
                     print(f"  ✗ Error processing component {component.get('lib_id', 'unknown')}: {e}")
+                    failed += 1
                     continue
 
+            if stop is not None:
+                print(f"\n⚠ Stopping migration: no answer at the prompt ({stop.why})")
+
             # Update schematic file
+            updated = True
             if migrations:
                 print("\n" + "="*70)
                 print("Updating schematic file...")
                 print("="*70)
 
-                if self._update_schematic_references(schematic_path, migrations):
+                updated = self._update_schematic_references(schematic_path, migrations)
+                if updated:
                     print("✓ Updated schematic references")
                 else:
                     print("⚠ Failed to update some schematic references")
 
             print("\n" + "="*70)
-            print("Migration Complete")
+            print("Migration Complete" if stop is None else "Migration stopped")
             print("="*70)
             print(f"✓ Migrated {migrated_count} component(s)")
+            if failed:
+                print(f"✗ {failed} component(s) or footprint(s) not migrated (see above)")
 
-            return True
+            if stop is not None:
+                raise stop
+            return updated and not failed
 
-        except KeyboardInterrupt:
-            print("\n⚠ Migration interrupted by user")
-            # Still update schematic with whatever was migrated
-            if migrations:
-                print(f"\nUpdating schematic with {len(migrations)} completed migration(s)...")
-                if self._update_schematic_references(schematic_path, migrations):
-                    print("✓ Updated schematic references")
-                else:
-                    print("⚠ Failed to update some schematic references")
-            print(f"✓ Migrated {migrated_count} component(s) before interruption")
-            return True
+        except NoAnswer:
+            raise
         except Exception as e:
             print(f"✗ Error during schematic migration: {e}")
-            import traceback
             traceback.print_exc()
             return False
 
     def _update_schematic_references(self, schematic_path: Path, migrations: List[Dict[str, str]]) -> bool:
-        """Update schematic file with new library references (including lib_symbols section)"""
+        """Update schematic file with new library references (including lib_symbols
+        section), keeping the file's line endings. A Footprint field changes only
+        in the migrated parts (their placed symbols and lib_symbols entries): another
+        part that uses the same footprint keeps its field."""
         try:
-            with open(schematic_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            content, eol = _read_kicad_text(schematic_path)
 
             original_content = content
+
+            # Footprint fields first, while the blocks still carry their old lib_id
+            moves = {m['old_lib_id']: (m['old_footprint'], m['new_footprint']) for m in migrations
+                     if m['old_lib_id'] and m['old_footprint'] and m['new_footprint']}
+            if moves:
+                pieces, pos = [], 0
+                for start, end, lib_id in _schematic_symbol_blocks(content):
+                    if lib_id not in moves:
+                        continue
+                    old_footprint, new_footprint = moves[lib_id]
+                    pieces.append(content[pos:start])
+                    pieces.append(content[start:end].replace(f'"Footprint" "{old_footprint}"',
+                                                             f'"Footprint" "{new_footprint}"'))
+                    pos = end
+                pieces.append(content[pos:])
+                content = ''.join(pieces)
 
             for migration in migrations:
                 old_lib_id = migration['old_lib_id']
                 new_lib_id = migration['new_lib_id']
-                old_footprint = migration['old_footprint']
-                new_footprint = migration['new_footprint']
 
                 # Update lib_id references in symbol instances
                 if old_lib_id and new_lib_id:
                     content = content.replace(f'(lib_id "{old_lib_id}")', f'(lib_id "{new_lib_id}")')
                     # Also update the symbol definition name in lib_symbols section
                     content = content.replace(f'(symbol "{old_lib_id}"', f'(symbol "{new_lib_id}"')
-
-                # Update footprint references
-                if old_footprint and new_footprint:
-                    content = content.replace(f'"Footprint" "{old_footprint}"', f'"Footprint" "{new_footprint}"')
 
             # Only write if changes were made
             if content != original_content:
@@ -1366,8 +1494,8 @@ class LibraryManager:
                 shutil.copy2(schematic_path, backup_path)
                 print(f"  Created backup: {backup_path.name}")
 
-                with open(schematic_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
+                _write_kicad_text(schematic_path, content, eol)
+                self._record_write(schematic_path, project=True)
 
                 return True
             else:
@@ -1379,12 +1507,22 @@ class LibraryManager:
             return False
 
     def process_zip_file(self, zip_path: str, add_to_project: bool = False,
-                         commit: bool = False, push: bool = False) -> None:
-        """Main method to process a zip file"""
+                         commit: bool = False, push: bool = False) -> int:
+        """The interactive import of a zip. Returns the exit code: 0 ok (or skipped
+        at the menu), 1 when a file, the project tables, the commit or the push
+        failed, 2 when the file is not a readable zip (as in the planned import).
+        NoAnswer at the category menu propagates (nothing written yet)."""
         print(f"Processing zip file: {zip_path}")
 
         # Extract zip contents
-        temp_dir, extracted_files = self.extract_zip_contents(zip_path)
+        try:
+            temp_dir, extracted_files = self.extract_zip_contents(zip_path)
+        except ZipUnreadable as e:
+            print(f"✗ cannot read zip: {e}", file=sys.stderr)
+            return EXIT_USAGE
+        except Exception as e:
+            print(f"✗ Error extracting zip file: {e}")
+            return EXIT_FAIL
 
         try:
             # Categorize files
@@ -1396,8 +1534,8 @@ class LibraryManager:
             print(f"  - 3D Models: {len(categorized_files['3d_models'])}")
 
             if not any(categorized_files.values()):
-                print("No KiCad files found in the zip archive.")
-                return
+                print("✗ No KiCad files found in the zip archive.")
+                return EXIT_FAIL
 
             # Display library selection menu
             self.display_library_menu()
@@ -1405,7 +1543,7 @@ class LibraryManager:
 
             if selected_library is None:
                 print("Skipping library addition.")
-                return
+                return EXIT_OK
 
             print(f"\nSelected library: {selected_library}")
 
@@ -1428,22 +1566,34 @@ class LibraryManager:
                 if self.add_3d_model(model_file):
                     success_count += 1
 
-            print(f"\n✓ Successfully processed {success_count}/{total_files} files")
+            if success_count == total_files:
+                print(f"\n✓ Successfully processed {success_count}/{total_files} files")
+                code = EXIT_OK
+            else:
+                print(f"\n✗ Processed only {success_count}/{total_files} files (see above)")
+                code = EXIT_FAIL
 
             # Update project settings if requested
             if add_to_project:
-                self.update_project_settings()
+                try:
+                    if not self.update_project_settings():
+                        code = EXIT_FAIL
+                except NoAnswer as e:
+                    print(f"✗ No answer at the project library menu ({e.why}); the libraries were not added to "
+                          f"the project")
+                    code = EXIT_USAGE
 
             # Commit changes if requested
-            if commit:
-                self.commit_changes(f"Add components from {Path(zip_path).name}")
+            if commit and not self.commit_changes(f"Add components from {Path(zip_path).name}"):
+                code = code or EXIT_FAIL
 
             # Push changes if requested
-            if push:
-                self.push_changes()
+            if push and not self.push_changes():
+                code = code or EXIT_FAIL
 
             # Ask if user wants to delete the zip file
             self.ask_delete_zip_file(zip_path)
+            return code
 
         finally:
             # Clean up temporary directory
@@ -1481,12 +1631,19 @@ class LibraryManager:
         except ValueError:
             return str(path)
 
-    def _library_symbol_names(self) -> Dict[str, List[str]]:
-        """Symbol names per category library key."""
+    def _library_symbol_names(self, errors: Optional[List[str]] = None) -> Dict[str, List[str]]:
+        """Symbol names per category library key. A library that is not UTF-8 text
+        raises, or with ``errors`` adds a message there and counts as empty."""
         out = {}
         for key, info in self.libraries.items():
             p = self.lib_sym_path / info['sym_file']
-            out[key] = _top_level_symbol_names(_read_kicad_text(p)[0]) if p.exists() else []
+            try:
+                out[key] = _top_level_symbol_names(_read_kicad_text(p)[0]) if p.exists() else []
+            except UnicodeDecodeError as e:
+                if errors is None:
+                    raise
+                errors.append(_not_utf8(self._rel(p), e))
+                out[key] = []
         return out
 
     def plan_zip_import(self, extracted: Path, library_key: str, link_3d: bool = False,
@@ -1515,10 +1672,14 @@ class LibraryManager:
 
         # Symbols: refuse a name the target library already has (appending it
         # again would leave two symbols of one name in the library).
-        existing = self._library_symbol_names()
+        existing = self._library_symbol_names(errors=plan['errors'])
         seen = set()
         for sf in sym_files:
-            text = _read_kicad_text(sf)[0]
+            try:
+                text = _read_kicad_text(sf)[0]
+            except UnicodeDecodeError as e:
+                plan['errors'].append(_not_utf8(sf.relative_to(extracted).as_posix(), e))
+                continue
             names = _top_level_symbol_names(text)
             fp_props = re.findall(r'\(property\s+"Footprint"\s+"([^"]*)"', text)
             for i, name in enumerate(names):
@@ -1566,59 +1727,75 @@ class LibraryManager:
 
         # Footprints (+ model links)
         for ff in fp_files:
-            text = lib3d.read_text(ff)
-            new_text = text
-            target = fp_dir / ff.name
-            row = {'name': ff.stem, 'source': ff.relative_to(extracted).as_posix(),
-                   'target': self._rel(target), 'action': 'add', 'model': None}
-            declared = lib3d.footprint_name(text)
-            if declared and declared != ff.stem:
-                plan['warnings'].append("footprint file %s declares the name '%s'" % (ff.name, declared))
-            for other in self._category_pretty_dirs():
-                if other != fp_dir and (other / ff.name).is_file():
-                    plan['warnings'].append("footprint %s also exists in %s" % (ff.stem, other.name))
-            if link_3d:
-                refs = lib3d.model_refs(text)
-                choice, rule = lib3d.match_model(ff.stem, refs, zip_models)
-                m = {'before': refs, 'after': refs, 'action': 'keep', 'rule': rule}
-                if choice:
-                    path = lib3d.model_ref_for(model_target_name[choice], model_prefix)
-                    named = [r for r in refs if lib3d.model_basename(r).lower() == choice.lower()]
-                    if refs and not named:
-                        plan['warnings'].append("footprint %s names %s, not %s; left as is"
-                                                % (ff.stem, ', '.join(refs), choice))
-                    else:
-                        new_text, m['action'] = lib3d.set_model_path(
-                            text, path, replace=lambda o, c=choice: lib3d.model_basename(o).lower() == c.lower())
-                else:
-                    # No model in the zip: point at the model folder if the file is already there.
-                    for r in refs:
-                        kind, found = lib3d.classify_ref(r, self.config)
-                        if kind in ('case', 'bare', 'absolute', 'other-var') and found:
-                            new_text, act = lib3d.fix_ref(new_text, r, self.config.library_mount + '/' + found)
-                            if act != 'keep':
-                                m['action'] = act
-                        elif kind != 'ok' and kind != 'stock':
-                            plan['warnings'].append("footprint %s: model %s is not in %s/" % (ff.stem, r, model_dir))
-                    if not refs:
-                        plan['warnings'].append("footprint %s: no 3D model (%s)" % (ff.stem, rule))
-                m['after'] = lib3d.model_refs(new_text)
-                row['model'] = m
-            if target.exists():
-                if target.read_bytes() == new_text.encode('utf-8'):
-                    row['action'] = 'identical'
-                elif overwrite:
-                    row['action'] = 'replace'
-                else:
-                    row['action'] = 'refused'
-                    plan['errors'].append("%s exists with different content (use --overwrite to replace)"
-                                          % self._rel(target))
-            row['_text'] = new_text
+            try:
+                row = self._plan_footprint(ff, extracted, plan, fp_dir, link_3d, overwrite, model_prefix,
+                                           model_target_name, zip_models)
+            except UnicodeDecodeError as e:
+                plan['errors'].append(_not_utf8(ff.relative_to(extracted).as_posix(), e))
+                continue
+            except ValueError as e:  # a footprint the model-path edit cannot parse
+                plan['errors'].append("%s cannot be read as a footprint: %s"
+                                      % (ff.relative_to(extracted).as_posix(), e))
+                continue
             plan['footprints'].append(row)
 
         if not (sym_files or fp_files or model_files):
             plan['errors'].append("no .kicad_sym, .kicad_mod or 3D model files in the zip")
         return plan
+
+    def _plan_footprint(self, ff, extracted, plan, fp_dir, link_3d, overwrite, model_prefix,
+                        model_target_name, zip_models) -> Dict:
+        """The plan row of one footprint (warnings and errors go into plan)."""
+        model_dir = self.config.model_dir
+        text = lib3d.read_text(ff)
+        new_text = text
+        target = fp_dir / ff.name
+        row = {'name': ff.stem, 'source': ff.relative_to(extracted).as_posix(),
+               'target': self._rel(target), 'action': 'add', 'model': None}
+        declared = lib3d.footprint_name(text)
+        if declared and declared != ff.stem:
+            plan['warnings'].append("footprint file %s declares the name '%s'" % (ff.name, declared))
+        for other in self._category_pretty_dirs():
+            if other != fp_dir and (other / ff.name).is_file():
+                plan['warnings'].append("footprint %s also exists in %s" % (ff.stem, other.name))
+        if link_3d:
+            refs = lib3d.model_refs(text)
+            choice, rule = lib3d.match_model(ff.stem, refs, zip_models)
+            m = {'before': refs, 'after': refs, 'action': 'keep', 'rule': rule}
+            if choice:
+                path = lib3d.model_ref_for(model_target_name[choice], model_prefix)
+                named = [r for r in refs if lib3d.model_basename(r).lower() == choice.lower()]
+                if refs and not named:
+                    plan['warnings'].append("footprint %s names %s, not %s; left as is"
+                                            % (ff.stem, ', '.join(refs), choice))
+                else:
+                    new_text, m['action'] = lib3d.set_model_path(
+                        text, path, replace=lambda o, c=choice: lib3d.model_basename(o).lower() == c.lower())
+            else:
+                # No model in the zip: point at the model folder if the file is already there.
+                for r in refs:
+                    kind, found = lib3d.classify_ref(r, self.config)
+                    if kind in ('case', 'bare', 'absolute', 'other-var') and found:
+                        new_text, act = lib3d.fix_ref(new_text, r, self.config.library_mount + '/' + found)
+                        if act != 'keep':
+                            m['action'] = act
+                    elif kind != 'ok' and kind != 'stock':
+                        plan['warnings'].append("footprint %s: model %s is not in %s/" % (ff.stem, r, model_dir))
+                if not refs:
+                    plan['warnings'].append("footprint %s: no 3D model (%s)" % (ff.stem, rule))
+            m['after'] = lib3d.model_refs(new_text)
+            row['model'] = m
+        if target.exists():
+            if target.read_bytes() == new_text.encode('utf-8'):
+                row['action'] = 'identical'
+            elif overwrite:
+                row['action'] = 'replace'
+            else:
+                row['action'] = 'refused'
+                plan['errors'].append("%s exists with different content (use --overwrite to replace)"
+                                      % self._rel(target))
+        row['_text'] = new_text
+        return row
 
     def apply_zip_plan(self, plan: Dict, extracted: Path) -> List[str]:
         """Do the writes of a plan without errors; return library-relative paths written."""
@@ -1663,48 +1840,86 @@ class LibraryManager:
     def _verify(self, footprints, roots, kicad_bin):
         return lib3d.verify_in_kicad(footprints, roots, kicad_bin, library_mount=self.config.library_mount)
 
-    def git_commit_paths(self, paths: List[str], message: str) -> bool:
-        """Commit exactly these paths (commit_changes stages everything with `git add .`)."""
-        message = self._commit_message(message)
+    def _git_ignored(self, paths: List[str]) -> List[str]:
+        """Those of ``paths`` (relative to the library root) that git ignores: not
+        tracked, and matched by a .gitignore, .git/info/exclude or the global
+        excludes file. `git add` refuses such a path and fails, so the commit
+        would not happen. [] when git cannot tell (no repository, say); the
+        commit reports that."""
         try:
-            self._git('add', '--', *paths)
+            r = subprocess.run(['git', 'check-ignore', '--stdin', '-z'], cwd=self.base_path,
+                               input='\0'.join(paths) + '\0', capture_output=True, text=True,
+                               encoding='utf-8', errors='replace')
+        except OSError:
+            return []
+        if r.returncode != 0:  # 1: none is ignored; 128: not a repository, or another error
+            return []
+        return [p for p in (r.stdout or '').split('\0') if p]
+
+    def git_commit_paths(self, paths: List[str], message: str) -> bool:
+        """Commit exactly these paths (relative to the library root): `git add -- P`
+        then `git commit -- P`, so changes the user staged elsewhere stay out.
+        A path git ignores (a model folder in .gitignore, say) is left out and
+        named, and kept in self.git_ignored; the others are committed."""
+        message = self._commit_message(message)
+        self.git_ignored = self._git_ignored(paths)
+        if self.git_ignored:
+            ignored = set(self.git_ignored)
+            print(f"⚠ Not committed (git ignores them): {', '.join(self.git_ignored)}")
+            paths = [p for p in paths if p not in ignored]
+            if not paths:
+                print("- Nothing to commit: git ignores every library file this run changed")
+                self._note_project_files()
+                return True
+        try:
+            # -f: every path left here is either not ignored or already tracked. A tracked file under an
+            # ignored folder (a model committed before the folder went into .gitignore) is not listed by
+            # check-ignore, but a plain `git add` of it still fails.
+            self._git('add', '-f', '--', *paths)
             self._git('commit', '-m', message, '--', *paths)
             print(f"✓ Committed {len(paths)} file(s): {message}")
+            self._note_project_files()
             return True
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        except subprocess.CalledProcessError as e:
             print(f"✗ Error committing changes: {e}")
+            return False
+        except FileNotFoundError:
+            print("✗ Git not found. Please ensure git is installed and the library is in a git repository.")
             return False
 
     def import_zip(self, zip_path: str, opts) -> Tuple[Dict, int]:
         """Plan, refuse or apply, optionally verify. Returns (report, exit code)."""
         report = {'command': 'import', 'zip': str(zip_path), 'library_root': str(self.base_path),
                   'dry_run': bool(opts.dry_run), 'link_3d': bool(opts.link_3d), 'written': []}
+
+        def usage(msg):
+            print(f"✗ {msg}")
+            report['errors'] = [msg]
+            return report, EXIT_USAGE
+
         key = self.resolve_category(opts.category) if opts.category else None
         if opts.category and not key:
-            report['errors'] = ["unknown category %r (one of: %s)" % (opts.category, ', '.join(self.libraries))]
-            return report, EXIT_USAGE
+            return usage("unknown category %r (one of: %s)" % (opts.category, ', '.join(self.libraries)))
         if opts.verify_3d:
             try:  # find KiCad before writing anything
                 lib3d.find_kicad(opts.kicad_bin)
             except RuntimeError as e:
-                report['errors'] = [str(e)]
-                return report, EXIT_USAGE
-        try:
-            zf = zipfile.ZipFile(zip_path)
-        except (zipfile.BadZipFile, OSError) as e:
-            report['errors'] = ["cannot read zip: %s" % e]
-            return report, EXIT_USAGE
+                return usage(str(e))
         temp_dir = Path(tempfile.mkdtemp(prefix='kpi_zip_'))
         try:
-            with zf:
-                zf.extractall(temp_dir)
+            try:
+                _extract_zip(zip_path, temp_dir)
+            except ZipUnreadable as e:
+                return usage("cannot read zip: %s" % e)
             if key is None:
                 if not opts.interactive:
-                    report['errors'] = ["--category is required without prompts (one of: %s)"
-                                        % ', '.join(self.libraries)]
-                    return report, EXIT_USAGE
+                    return usage("--category is required without prompts (one of: %s)" % ', '.join(self.libraries))
                 self.display_library_menu()
-                key = self.get_library_selection()
+                try:
+                    key = self.get_library_selection()
+                except NoAnswer as e:
+                    return usage("no answer at the category menu (%s); nothing written. Pass --category (one of: "
+                                 "%s) and --yes to import without prompts" % (e.why, ', '.join(self.libraries)))
                 if key is None:
                     report['errors'] = ["skipped at the library menu"]
                     return report, EXIT_OK
@@ -1744,12 +1959,27 @@ class LibraryManager:
                 if v['failed'] or v['load_errors']:
                     code = EXIT_FAIL
             if not opts.dry_run:
+                errors = report.setdefault('errors', [])
                 if opts.add_to_project:
-                    self.update_project_settings()
+                    try:
+                        if not self.update_project_settings():
+                            errors.append("the libraries were not added to the project's tables (see above)")
+                            code = code or EXIT_FAIL
+                    except NoAnswer as e:
+                        errors.append("no answer at the project library menu (%s); the libraries were not added "
+                                      "to the project" % e.why)
+                        print(f"✗ {errors[-1]}")
+                        code = code or EXIT_USAGE
                 if opts.commit and report['written']:
-                    self.git_commit_paths(report['written'], f"Add components from {Path(zip_path).name}")
-                if opts.push:
-                    self.push_changes()
+                    if not self.git_commit_paths(report['written'], f"Add components from {Path(zip_path).name}"):
+                        errors.append("the commit failed (the files are written; see git's message above)")
+                        code = code or EXIT_FAIL
+                    if self.git_ignored:
+                        report['warnings'].append("not committed, git ignores them: %s"
+                                                  % ', '.join(self.git_ignored))
+                if opts.push and not self.push_changes():
+                    errors.append("git push failed (see git's message above)")
+                    code = code or EXIT_FAIL
                 if opts.delete_zip and code != EXIT_OK:
                     print(f"⚠ Kept {Path(zip_path).name}: the import did not finish cleanly")
                     report['zip_action'] = 'kept'
@@ -1800,20 +2030,25 @@ class LibraryManager:
             rep['verify_3d'] = self._verify(fps, [self.base_path], opts.kicad_bin)
             v = rep['verify_3d']
             _print_verify_summary(v)
-            if v['failed']:
+            if v['failed'] or v['load_errors']:  # a footprint KiCad cannot load fails the check too
                 return rep, EXIT_FAIL
         return rep, (EXIT_FAIL if remaining else EXIT_OK)
 
 
 def _print_verify_summary(v) -> None:
-    """One line for a KiCad 3D check. A footprint can carry several (model ...)
-    blocks; one that fails next to one that loads leaves the part with its body."""
+    """One line per footprint KiCad could not load, then one line for the KiCad
+    3D check. A footprint can carry several (model ...) blocks; one that fails
+    next to one that loads leaves the part with its body."""
+    load_errors = v.get('load_errors') or []
+    for e in load_errors:
+        print(f"✗ KiCad could not load {Path(e['footprint']).name}: {e['error']}")
     failed_fps = {f['footprint'] for f in v['failed']}
     no_body = set(v.get('no_body', failed_fps))
     detail = (f" ({len(no_body)} of them with no 3D body, {len(failed_fps - no_body)} with a dead extra "
               f"reference next to one that loads)") if failed_fps else ""
+    unloadable = f", {len(load_errors)} that KiCad could not load" if load_errors else ""
     print(f"3D check: {len(v['loaded'])} loaded, {len(failed_fps)} with a model that did not load{detail}, "
-          f"{len(v['no_model'])} without a model (KiCad {v['kicad_version']})")
+          f"{len(v['no_model'])} without a model{unloadable} (KiCad {v['kicad_version']})")
 
 
 def _print_plan(manager, plan, zip_path) -> None:
@@ -1845,38 +2080,48 @@ def _new_mode_requested(args) -> bool:
                 args.keep_zip, args.delete_zip, args.overwrite])
 
 
-def _run_new_mode(manager, args) -> int:
-    """Run --check-3d or a planned zip import; print JSON when asked. Returns the exit code."""
-    args.interactive = not (args.yes or args.dry_run or args.json)
+def _usage_problem(args) -> Optional[str]:
+    """Why a --check-3d / planned-import command line cannot run, or None."""
     if not args.interactive:
         bad = [f for f, on in (('--add-to-project', args.add_to_project), ('--migrate', args.migrate),
                                ('--migrate-schematic', args.migrate_schematic)) if on]
         if bad:
             verb = 'asks' if len(bad) == 1 else 'ask'
-            print(f"✗ {', '.join(bad)} {verb} questions; run without --yes/--dry-run/--json", file=sys.stderr)
-            return EXIT_USAGE
+            return f"{', '.join(bad)} {verb} questions; run without --yes/--dry-run/--json"
     if args.keep_zip and args.delete_zip:
-        print("✗ --keep-zip and --delete-zip together", file=sys.stderr)
-        return EXIT_USAGE
-    out = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
-    with out:
-        try:
-            if args.check_3d:
-                report, code = manager.check_3d(args)
-            else:
-                if not args.input_file or not args.input_file.lower().endswith('.zip'):
-                    print("✗ these options need a .zip file (or --check-3d)")
-                    return EXIT_USAGE
-                if not os.path.exists(args.input_file):
-                    print(f"Error: File '{args.input_file}' not found")
-                    return EXIT_USAGE
-                report, code = manager.import_zip(args.input_file, args)
-                if code == EXIT_USAGE:
-                    for e in report.get('errors', []):
-                        print(f"✗ {e}")
-        except RuntimeError as e:  # KiCad missing or its check failed to run
-            print(f"✗ {e}")
-            report, code = {'errors': [str(e)]}, EXIT_FAIL
+        return "--keep-zip and --delete-zip together"
+    if not args.check_3d:
+        if not args.input_file or not args.input_file.lower().endswith('.zip'):
+            return "these options need a .zip file (or --check-3d)"
+        if not os.path.isfile(args.input_file):
+            return f"file '{args.input_file}' not found"
+    return None
+
+
+def _run_new_mode(manager, args) -> int:
+    """Run --check-3d or a planned zip import. With --json, stdout gets exactly one
+    JSON object whatever happens (usage errors included). Returns the exit code."""
+    args.interactive = not (args.yes or args.dry_run or args.json)
+    command = 'check-3d' if args.check_3d else 'import'
+    problem = _usage_problem(args)
+    if problem:
+        print(f"✗ {problem}", file=sys.stderr)
+        report, code = {'command': command, 'errors': [problem]}, EXIT_USAGE
+    else:
+        out = contextlib.redirect_stdout(sys.stderr) if args.json else contextlib.nullcontext()
+        with out:
+            try:
+                if args.check_3d:
+                    report, code = manager.check_3d(args)
+                else:
+                    report, code = manager.import_zip(args.input_file, args)
+            except RuntimeError as e:  # KiCad missing or its check failed to run
+                print(f"✗ {e}")
+                report, code = {'command': command, 'errors': [str(e)]}, EXIT_FAIL
+            except Exception as e:  # a bug: keep the one-JSON-object promise, traceback on stderr
+                traceback.print_exc()
+                report, code = {'command': command, 'errors': [f"unexpected error: {type(e).__name__}: {e}"]}, \
+                    EXIT_FAIL
     report['exit_code'] = code
     report['ok'] = code == EXIT_OK
     if args.json:
@@ -1908,9 +2153,26 @@ Documentation: https://github.com/aqsnyder/kicad-part-importer/tree/main/docs
 """
 
 
+def _json_requested(argv) -> bool:
+    """--json on the command line (argparse also takes a unique prefix such as --js)."""
+    return any(a.startswith('--j') and '--json'.startswith(a) for a in argv)
+
+
+class _Parser(argparse.ArgumentParser):
+    """An ArgumentParser that keeps the --json promise for its own usage errors:
+    with json_requested set, one JSON object goes to stdout before the usual
+    usage message on stderr (exit code 2)."""
+    json_requested = False
+
+    def error(self, message):
+        if self.json_requested:
+            print(json.dumps({'errors': [message], 'exit_code': EXIT_USAGE, 'ok': False}, indent=1))
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
     env = libcfg.ENV_PREFIX
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="kicad-part-importer",
         description="Import vendor part zips (TI / Ultra Librarian, SamacSys, SnapEDA) into a categorized "
                     "KiCad library and link every footprint to its 3D model.",
@@ -1934,11 +2196,11 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.add_argument('--add-to-project', action='store_true',
                      help="Add category libraries (asks which) to the project's sym-lib-table and fp-lib-table")
     cmd.add_argument('--migrate', action='store_true',
-                     help='Move symbols from FILE, or from every other .kicad_sym in the symbol folder, into '
-                          'the categories (asks for each)')
+                     help='Copy symbols from FILE, or from every other .kicad_sym in the symbol folder, into '
+                          'the categories (asks for each; the originals stay)')
     cmd.add_argument('--migrate-schematic', metavar='SCHEMATIC',
-                     help='Move the custom parts a .kicad_sch uses into the categories and rewrite its '
-                          'references (asks for each; keeps a .kicad_sch.bak)')
+                     help='Copy the custom parts a .kicad_sch uses into the categories and point its '
+                          'references at the copies (asks for each; keeps a .kicad_sch.bak)')
     cmd.add_argument('--show-config', action='store_true',
                      help='Print the effective settings as JSON and exit')
 
@@ -2015,12 +2277,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     git = parser.add_argument_group('git (default: git_commit / git_push in the config file, else off)')
     git.add_argument('--commit', dest='commit', action='store_const', const=True, default=None,
-                     help='Commit after the work (env %sGIT_COMMIT). A planned import commits exactly the files '
-                          'it wrote; other commands stage the library root (git add .)' % env)
+                     help='Commit the library files the command wrote, and nothing else (env %sGIT_COMMIT). '
+                          'Project files it edits (library tables, schematic) are left to you. --init commits '
+                          'only with this flag' % env)
     git.add_argument('--no-commit', dest='commit', action='store_const', const=False,
                      help='Do not commit, whatever the config file says')
     git.add_argument('--push', dest='push', action='store_const', const=True, default=None,
-                     help='Run git push afterwards (env %sGIT_PUSH). Never done otherwise' % env)
+                     help='Run git push afterwards (env %sGIT_PUSH). Never done otherwise; --init pushes only '
+                          'with this flag' % env)
     git.add_argument('--no-push', dest='push', action='store_const', const=False,
                      help='Do not push, whatever the config file says')
     return parser
@@ -2061,9 +2325,25 @@ def _resolve_git(args, config) -> None:
     args.push = config.git_push if args.push is None else args.push
 
 
+def _finish_git(manager, args, ok: bool, message: str) -> int:
+    """After a command that writes: commit (the library files it wrote) and push
+    when asked, and only when the command succeeded. Returns the exit code: 0,
+    or 1 when the command, the commit or the push failed."""
+    if not ok:
+        return EXIT_FAIL
+    code = EXIT_OK
+    if args.commit and not manager.commit_changes(message):
+        code = EXIT_FAIL
+    if args.push and not manager.push_changes():
+        code = EXIT_FAIL
+    return code
+
+
 def run_init(args) -> int:
     """--init: write a starter config file into the library root (unless it has
-    one), then create the folders and the empty category libraries."""
+    one), then create the folders and the empty category libraries. It commits
+    and pushes only with --commit / --push on the command line: git_commit and
+    git_push (config file or environment) do not apply to it."""
     cli = _cli_settings(args)
     explicit_config = bool(args.config or os.environ.get(libcfg.CONFIG_ENV))
     try:
@@ -2078,6 +2358,7 @@ def run_init(args) -> int:
             print(f"✗ {root} is inside the library {outer} ({libcfg.config_files_in(outer)[0].name} there). "
                   f"Pass --library DIR to create a separate library here anyway.", file=sys.stderr)
             return EXIT_USAGE
+    written_config = None
     existing = libcfg.config_files_in(root)
     if existing:
         if explicit_config:
@@ -2097,18 +2378,24 @@ def run_init(args) -> int:
                   f"{', '.join(given)}")
     else:
         print(f"Library root: {root}")
-        if cfg.config_file is None:  # no template: describe the libraries already there, if any
-            found = libcfg.infer_categories(root, cfg.symbol_dir, cfg.footprint_dir, cfg.library_prefix)
+        explicit = _given_settings(cli)
+        if cfg.config_file is not None:
+            # A template: every setting it names is written as given, like a flag.
+            explicit |= set(libcfg.load_config_file(cfg.config_file))
+        else:  # no template: describe the libraries already there, if any
+            found = libcfg.infer_categories(root, cfg.symbol_dir, cfg.footprint_dir, cfg.library_prefix,
+                                            known=cfg.categories)
             if found:
                 cfg = _with_categories(cfg, found)
                 print(f"Found {len(found)} existing libraries named {cfg.library_prefix}*; they become the "
                       f"categories: {', '.join(c.key for c in cfg.categories)}")
         try:
-            path, fmt = libcfg.write_starter_config(cfg, explicit=_given_settings(cli), fmt=args.config_format,
+            path, fmt = libcfg.write_starter_config(cfg, explicit=explicit, fmt=args.config_format,
                                                     version=__version__)
         except (OSError, libcfg.ConfigError) as e:
             print(f"✗ cannot write the config file: {e}", file=sys.stderr)
             return EXIT_FAIL
+        written_config = path
         print(f"✓ Wrote {path.name}: prefix '{cfg.library_prefix}', {len(cfg.categories)} categories, "
               f"mount {cfg.library_mount}")
         # Read it back, as every later command will (and fail loudly if it cannot be).
@@ -2119,19 +2406,21 @@ def run_init(args) -> int:
             print(f"✗ {e}", file=sys.stderr)
             return EXIT_FAIL
     manager = LibraryManager(config=cfg)
-    _resolve_git(args, cfg)
+    if written_config is not None:
+        manager._record_write(written_config)
+    # Only the flags: a git_commit / git_push from a template, the new file or
+    # the environment must not commit (or fail to, in a folder that is no
+    # repository yet) the moment the library is created.
+    args.commit, args.push = args.commit is True, args.push is True
     if not manager.initialize_libraries():
         return EXIT_FAIL
-    if args.commit:
-        manager.commit_changes("Initialize the part library")
-    if args.push:
-        manager.push_changes()
+    code = _finish_git(manager, args, True, "Initialize the part library")
     first = cfg.categories[0].key
     print("\nNext:")
     print("  kicad-part-importer --show-config")
     print(f"  kicad-part-importer part.zip --category {first} --link-3d --dry-run")
     print("  kicad-part-importer --add-to-project --project-dir <folder with sym-lib-table>")
-    return EXIT_OK
+    return code
 
 
 def _not_a_library(config) -> str:
@@ -2140,9 +2429,100 @@ def _not_a_library(config) -> str:
             f"command inside your library, pass --library DIR, or create one there with --init.")
 
 
+def _exit_usage(msg: str, args) -> None:
+    """Exit 2 with msg on stderr (and, with --json, as the one JSON object on stdout)."""
+    print(f"✗ {msg}", file=sys.stderr)
+    if args.json:
+        print(json.dumps({'errors': [msg], 'exit_code': EXIT_USAGE, 'ok': False}, indent=1))
+    sys.exit(EXIT_USAGE)
+
+
+def _flags_do(flags) -> str:
+    """'--commit does' / '--commit and --push do'."""
+    return ' and '.join(flags) + (' does' if len(flags) == 1 else ' do')
+
+
+def _input_problem(path: str, suffixes) -> Optional[str]:
+    """Why the input file cannot be used (missing, or not one of suffixes), or None."""
+    if not os.path.isfile(path):
+        return f"file '{path}' not found"
+    if not path.lower().endswith(tuple(suffixes)):
+        return f"'{path}' is not a {' or '.join(suffixes)} file"
+    return None
+
+
+def _no_answer_hint(args, manager) -> str:
+    """What to do instead of answering the prompt of this command line."""
+    if args.migrate or args.migrate_schematic or (args.input_file or '').lower().endswith('.kicad_sym'):
+        return "Migration asks for each part's category; run it in a terminal."
+    if args.input_file:
+        return ("Pass --category (one of: %s) and --yes to import without prompts."
+                % ', '.join(manager.libraries))
+    return "--add-to-project asks which libraries to add; run it in a terminal."
+
+
+def _run_prompting(manager, args, config, parser) -> int:
+    """--init-libraries, --migrate-schematic, --migrate, --add-to-project and the
+    interactive import. Returns the exit code; NoAnswer propagates."""
+    if args.init_libraries:
+        return _finish_git(manager, args, manager.initialize_libraries(), "Initialize library files")
+
+    if (args.migrate_schematic or args.migrate or args.add_to_project or args.input_file) \
+            and not manager.library_exists():
+        print(f"✗ {_not_a_library(config)}", file=sys.stderr)
+        return EXIT_USAGE
+
+    if args.migrate_schematic:
+        schematic_file = args.migrate_schematic
+        problem = _input_problem(schematic_file, ('.kicad_sch',))
+        if problem:
+            print(f"✗ {problem}", file=sys.stderr)
+            return EXIT_USAGE
+        ok = manager.migrate_schematic(schematic_file)
+        return _finish_git(manager, args, ok, f"Migrate components from {os.path.basename(schematic_file)}")
+
+    if args.migrate:
+        if args.input_file:
+            problem = _input_problem(args.input_file, ('.kicad_sym',))
+            if problem:
+                print(f"✗ {problem}", file=sys.stderr)
+                return EXIT_USAGE
+            ok = manager.migrate_single_file(args.input_file)
+        else:
+            ok = manager.migrate_symbols()
+        return _finish_git(manager, args, ok, "Migrate symbols to categorized libraries")
+
+    # --add-to-project alone: the tables are project files, outside the library
+    # repository, so the tool's git options do not apply to them.
+    if args.add_to_project and not args.input_file:
+        if args.explicit_git:
+            print(f"⚠ {_flags_do(args.explicit_git)} not apply to --add-to-project: the tables are project "
+                  f"files; commit them in the project", file=sys.stderr)
+        print("Updating project library settings...")
+        return EXIT_OK if manager.update_project_settings() else EXIT_FAIL
+
+    if args.input_file:
+        problem = _input_problem(args.input_file, ('.zip', '.kicad_sym'))
+        if problem:
+            print(f"✗ {problem}", file=sys.stderr)
+            return EXIT_USAGE
+        if args.input_file.lower().endswith('.zip'):
+            return manager.process_zip_file(args.input_file, add_to_project=args.add_to_project,
+                                            commit=args.commit, push=args.push)
+        ok = manager.migrate_single_file(args.input_file)
+        return _finish_git(manager, args, ok, f"Migrate symbols from {os.path.basename(args.input_file)}")
+
+    # No input file and no other options specified
+    print("✗ nothing to do: give a part zip, or a command such as --init, --check-3d, --add-to-project or "
+          "--migrate", file=sys.stderr)
+    parser.print_help(sys.stderr)
+    return EXIT_USAGE
+
+
 def main(argv=None):
     """Main entry point"""
     parser = build_parser()
+    parser.json_requested = _json_requested(sys.argv[1:] if argv is None else [str(a) for a in argv])
     args = parser.parse_args(argv)
     _guard_console_encoding()
 
@@ -2153,16 +2533,14 @@ def main(argv=None):
                                   ('--check-3d', args.check_3d), ('--show-config', args.show_config))
                   if on]
         if others or _new_mode_requested(args):
-            print("✗ --init runs alone (name the folder with --library DIR); got %s"
-                  % ', '.join(others or ['zip import options']), file=sys.stderr)
-            sys.exit(EXIT_USAGE)
+            _exit_usage("--init runs alone (name the folder with --library DIR); got %s"
+                        % ', '.join(others or ['zip import options']), args)
         sys.exit(run_init(args))
 
     try:
         config = libcfg.resolve_config(_cli_settings(args))
     except libcfg.ConfigError as e:
-        print(f"✗ {e}", file=sys.stderr)
-        sys.exit(EXIT_USAGE)
+        _exit_usage(str(e), args)
     if args.show_config:
         print(json.dumps(config.to_dict(), indent=1))
         return
@@ -2170,15 +2548,14 @@ def main(argv=None):
     # Create library manager
     manager = LibraryManager(config=config)
 
-    explicit_git = [f for f, on in (('--commit', args.commit), ('--push', args.push)) if on]
+    args.explicit_git = [f for f, on in (('--commit', args.commit), ('--push', args.push)) if on]
     _resolve_git(args, config)
     if (args.fix_3d or args.all_footprint_libs) and not args.check_3d:
         # Without this they would be ignored and a zip would go to the prompting import.
-        print("✗ --fix-3d and --all-footprint-libs need --check-3d", file=sys.stderr)
-        sys.exit(EXIT_USAGE)
+        _exit_usage("--fix-3d and --all-footprint-libs need --check-3d", args)
     if args.check_3d:
-        if explicit_git:
-            print(f"⚠ {' and '.join(explicit_git)} do not apply to --check-3d: it never commits or pushes",
+        if args.explicit_git:
+            print(f"⚠ {_flags_do(args.explicit_git)} not apply to --check-3d: it never commits or pushes",
                   file=sys.stderr)
         args.commit = args.push = False
     if args.check_3d or _new_mode_requested(args):
@@ -2191,91 +2568,16 @@ def main(argv=None):
             sys.exit(EXIT_USAGE)
         sys.exit(_run_new_mode(manager, args))
 
-    # Handle --init-libraries option
-    if args.init_libraries:
-        success = manager.initialize_libraries()
-        if success and args.commit:
-            manager.commit_changes("Initialize library files")
-        if success and args.push:
-            manager.push_changes()
-        return
-
-    if (args.migrate_schematic or args.migrate or args.add_to_project or args.input_file) \
-            and not manager.library_exists():
-        print(f"✗ {_not_a_library(config)}", file=sys.stderr)
-        sys.exit(EXIT_USAGE)
-
-    # Handle --migrate-schematic option
-    if args.migrate_schematic:
-        schematic_file = args.migrate_schematic
-        if not os.path.exists(schematic_file):
-            print(f"Error: Schematic file '{schematic_file}' not found")
-            sys.exit(1)
-
-        success = manager.migrate_schematic(schematic_file)
-        if success and args.commit:
-            manager.commit_changes(f"Migrate components from {os.path.basename(schematic_file)}")
-        if success and args.push:
-            manager.push_changes()
-        return
-
-    # Handle --migrate option
-    if args.migrate:
-        if args.input_file:
-            # Migrate specific file
-            success = manager.migrate_single_file(args.input_file)
-        else:
-            # Migrate all files
-            success = manager.migrate_symbols()
-
-        if success and args.commit:
-            manager.commit_changes("Migrate symbols to categorized libraries")
-        if success and args.push:
-            manager.push_changes()
-        return
-
-    # If only --add-to-project is specified, just update project settings
-    if args.add_to_project and not args.input_file:
-        print("Updating project library settings...")
-        success = manager.update_project_settings()
-        if success and args.commit:
-            manager.commit_changes("Update project library settings")
-        if success and args.push:
-            manager.push_changes()
-        return
-
-    # If input file is provided, process it
-    if args.input_file:
-        # Validate file exists
-        if not os.path.exists(args.input_file):
-            print(f"Error: File '{args.input_file}' not found")
-            sys.exit(1)
-
-        # Check if it's a zip file or kicad_sym file
-        if args.input_file.lower().endswith('.zip'):
-            # Process zip file
-            manager.process_zip_file(
-                args.input_file,
-                add_to_project=args.add_to_project,
-                commit=args.commit,
-                push=args.push
-            )
-        elif args.input_file.lower().endswith('.kicad_sym'):
-            # Process single symbol file
-            success = manager.migrate_single_file(args.input_file)
-            if success and args.commit:
-                manager.commit_changes(f"Migrate symbols from {os.path.basename(args.input_file)}")
-            if success and args.push:
-                manager.push_changes()
-        else:
-            print("Error: Unsupported file type. Please provide a .zip or .kicad_sym file")
-            sys.exit(1)
-    else:
-        # No input file and no other options specified
-        print("Error: nothing to do. Give a part zip, or a command such as --init, --check-3d, "
-              "--add-to-project or --migrate")
-        parser.print_help()
-        sys.exit(1)
+    try:
+        code = _run_prompting(manager, args, config, parser)
+    except NoAnswer as e:
+        print(f"✗ No answer at the prompt ({e.why}); stopped. {_no_answer_hint(args, manager)}",
+              file=sys.stderr)
+        code = EXIT_USAGE
+    except KeyboardInterrupt:  # Ctrl+C between prompts
+        print("\n✗ Interrupted; stopped.", file=sys.stderr)
+        code = EXIT_USAGE
+    sys.exit(code)
 
 
 if __name__ == "__main__":

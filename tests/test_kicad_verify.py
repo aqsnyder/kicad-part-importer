@@ -122,6 +122,25 @@ class KiCadVerify(unittest.TestCase):
         self.assertEqual(lib3d.model_refs(lib3d.read_text(pretty / "TWO.kicad_mod")),
                          [self.mount + "/3d_models/REAL.step"])
 
+    def test_footprint_kicad_cannot_load_fails_the_check(self):
+        # A footprint pcbnew refuses (an unknown token) next to one that loads: the
+        # path check is clean, but --verify-3d must fail and name the broken one.
+        (self.lib / "3d_models" / "REAL.step").write_bytes(self.step)
+        pretty = self.lib / "lib_fp" / "lib_protection.pretty"
+        model = '"%s/3d_models/REAL.step"' % self.mount
+        lib3d.write_text(pretty / "GOOD.kicad_mod", H.FP_SAMACSYS.format(name="GOOD", model=model))
+        broken = H.FP_SAMACSYS.format(name="BROKEN", model=model).replace('(descr "test")', "(bogus_token 1 2 3)")
+        lib3d.write_text(pretty / "BROKEN.kicad_mod", broken)
+        r = H.run_importer("--library-root", self.lib, "--check-3d", "--verify-3d", "--json")
+        self.assertEqual(r.returncode, 1, r.stderr)
+        rep = json.loads(r.stdout)
+        self.assertEqual(rep["counts"], {"ok": 2})
+        v = rep["verify_3d"]
+        self.assertEqual([Path(e["footprint"]).name for e in v["load_errors"]], ["BROKEN.kicad_mod"])
+        self.assertEqual([Path(p).name for p in v["loaded"]], ["GOOD.kicad_mod"])
+        self.assertIn("KiCad could not load BROKEN.kicad_mod: FootprintLoad returned None", r.stderr)
+        self.assertIn("1 that KiCad could not load", r.stderr)
+
     def test_environment_variable_mount(self):
         # A library reached through a path variable of its own, not ${KIPRJMOD}.
         H.ti_zip(self.zips / "p.zip", step=self.step)

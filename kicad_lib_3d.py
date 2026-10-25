@@ -232,8 +232,9 @@ def classify_ref(ref, library):
 
     Returns (kind, detail). kind is one of:
       ok        -> mount form and the file exists in the library
-      case      -> mount form, the file exists but with other letter case
-                   (loads on Windows, not on Linux)
+      case      -> mount form, the file exists but with other letter case in
+                   its name or in a folder of its path (loads on Windows and
+                   macOS, not on Linux)
       missing   -> mount form but no such file
       stock     -> ${KICADn_3DMODEL_DIR}/... (KiCad's own models; not checked)
       bare      -> file name only (resolves against the project folder)
@@ -247,12 +248,13 @@ def classify_ref(ref, library):
     mount = cfg.library_mount + "/"
     if ref.startswith(mount):
         rel = ref[len(mount):]
-        parent, _, name = rel.rpartition("/")
-        hit = spelling_in(root / parent, name)
-        if hit is None:
+        # Every folder of the path counts, not only the file name: on Windows and
+        # macOS "3D_Models/X.step" opens "3d_models/X.step", on Linux it does not.
+        real = real_path_in(root, rel)
+        if real is None:
             return "missing", None
-        real = (parent + "/" if parent else "") + hit
-        return ("ok", rel) if hit == name else ("case", real)
+        same = real == "/".join(p for p in rel.split("/") if p not in ("", "."))
+        return ("ok", rel) if same else ("case", real)
     if _STOCK_VAR_RE.match(ref):
         return "stock", None
     name = model_basename(ref)
@@ -267,39 +269,66 @@ def classify_ref(ref, library):
     return kind, find_model_in_library(name, cfg)
 
 
-def spelling_in(directory, name):
+def spelling_in(directory, name, folder=False):
     """The real spelling of ``name`` in ``directory``: the exact name if present,
     else the one case-insensitive match, else None. (Windows file systems
-    match any case, Linux does not, so a reference must use the real one.)"""
+    match any case, Linux does not, so a reference must use the real one.)
+    ``name`` is a file, or with ``folder`` a sub-folder."""
     d = Path(directory)
     if not d.is_dir():
         return None
-    names = [p.name for p in d.iterdir() if p.is_file()]
+    names = [p.name for p in d.iterdir() if (p.is_dir() if folder else p.is_file())]
     if name in names:
         return name
     hits = [n for n in names if n.lower() == name.lower()]
     return hits[0] if len(hits) == 1 else None
 
 
+def real_path_in(root, rel):
+    """The real spelling of the file ``rel`` (a '/'-separated path under ``root``),
+    resolved one component at a time with :func:`spelling_in`, so a folder in
+    the wrong letter case is caught as well as the file name. None when a
+    component is not there (or is ambiguous)."""
+    cur, out = Path(root), []
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if not parts:
+        return None
+    for i, part in enumerate(parts):
+        if part == "..":
+            cur, hit = cur.parent, part
+        else:
+            hit = spelling_in(cur, part, folder=i < len(parts) - 1)
+            if hit is None:
+                return None
+            cur = cur / hit
+        out.append(hit)
+    return "/".join(out)
+
+
 def find_model_in_library(name, library):
-    """Library-relative path of <name> (real spelling) in the model folder, else
-    in the extra ``model_search_dirs`` in order; None if in none of them."""
+    """Library-relative path of <name> (real spelling, folders included) in the
+    model folder, else in the extra ``model_search_dirs`` in order; None if in
+    none of them."""
     cfg = libcfg.as_config(library)
     for d in cfg.model_search_path:
-        hit = spelling_in(Path(cfg.library_root) / d, name)
+        hit = real_path_in(cfg.library_root, d + "/" + name)
         if hit:
-            return d + "/" + hit
+            return hit
     return None
 
 
 def footprint_dirs(library, all_libs=False):
-    """The footprint libraries to check: the category libraries
-    (``<footprint_dir>/<library_prefix>*.pretty``) or, with all_libs, every
-    .pretty under the footprint folder."""
+    """The footprint libraries to check: the category libraries (every
+    ``<footprint_dir>/<library_prefix>*.pretty``, plus the ``.pretty`` of each
+    configured category, whatever its name) or, with all_libs, every .pretty
+    under the footprint folder."""
     cfg = libcfg.as_config(library)
     base = Path(cfg.library_root) / cfg.footprint_dir
     pat = "*.pretty" if all_libs else glob.escape(cfg.library_prefix) + "*.pretty"
-    return [d for d in sorted(base.glob(pat)) if d.is_dir()]
+    dirs = set(d for d in base.glob(pat) if d.is_dir())
+    if not all_libs:
+        dirs |= set(base / c.fp_dir for c in cfg.categories if (base / c.fp_dir).is_dir())
+    return sorted(dirs)
 
 
 def footprint_files(library, all_libs=False):

@@ -192,6 +192,44 @@ class ClassifyAndFix(unittest.TestCase):
         self.assertEqual(lib3d.classify_ref("${KICAD_3D_PROJECT_MODELS}/a/b/TVS24A.stp", r),
                          ("other-var", "3d_models/TVS24A.stp"))
 
+    def test_folder_in_the_wrong_case_is_case_not_ok(self):
+        # The folder part of the path counts too: "3D_Models/X" opens "3d_models/X"
+        # on Windows and macOS only. (On Linux it used to be "missing", with no fix.)
+        mount = self.cfg.library_mount
+        self.assertEqual(lib3d.classify_ref(mount + "/3D_Models/TVS24A.stp", self.root),
+                         ("case", "3d_models/TVS24A.stp"))
+        self.assertEqual(lib3d.classify_ref(mount + "/3D_MODELS/mixed.step", self.root),
+                         ("case", "3d_models/Mixed.STEP"))
+        self.assertEqual(lib3d.classify_ref(mount + "/3D_Models/NOPE.stp", self.root), ("missing", None))
+        self.assertEqual(lib3d.real_path_in(self.root, "3D_models/TVS24A.stp"), "3d_models/TVS24A.stp")
+        self.assertIsNone(lib3d.real_path_in(self.root, "3d_models"))  # a folder, not a file
+
+    def test_check_and_fix_a_folder_in_the_wrong_case(self):
+        pretty = self.root / "lib_fp" / "lib_protection.pretty"
+        bad = self.cfg.library_mount + "/3D_Models/TVS24A.stp"
+        lib3d.write_text(pretty / "TVS24A.kicad_mod", H.FP_SAMACSYS.format(name="TVS24A", model='"%s"' % bad))
+        rep = lib3d.check_library(self.root)
+        self.assertEqual(rep["counts"], {"case": 1})
+        self.assertEqual(rep["fixable"][0]["fix"], self.cfg.library_mount + "/3d_models/TVS24A.stp")
+        lib3d.apply_fixes(self.root, rep["fixable"])
+        self.assertEqual(lib3d.check_library(self.root)["counts"], {"ok": 1})
+
+    def test_found_model_gets_the_folder_spelling_on_disk(self):
+        # model_dir "3D_Models" names the folder 3d_models in another case: a model
+        # found there is pointed at the folder as it is spelled on disk, which is the
+        # one that opens on Linux too (the configured spelling used to be kept, and
+        # on Linux the model was not found at all).
+        (self.root / "3d_models" / "BARE.step").write_bytes(H.FAKE_STEP)
+        cfg = libcfg.LibraryConfig(self.root, model_dir="3D_Models")
+        self.assertEqual(lib3d.find_model_in_library("BARE.step", cfg), "3d_models/BARE.step")
+        self.assertEqual(lib3d.find_model_in_library("bare.STEP", cfg), "3d_models/BARE.step")
+        self.assertEqual(lib3d.classify_ref("BARE.step", cfg), ("bare", "3d_models/BARE.step"))
+        pretty = self.root / "lib_fp" / "lib_protection.pretty"
+        lib3d.write_text(pretty / "B.kicad_mod", H.FP_SAMACSYS.format(name="B", model="BARE.step"))
+        rep = lib3d.check_library(cfg)
+        self.assertEqual(rep["counts"], {"bare": 1})
+        self.assertEqual(rep["fixable"][0]["fix"], cfg.library_mount + "/3d_models/BARE.step")
+
     def test_model_search_dirs_are_searched_after_the_model_dir(self):
         d = self.root / "vendor" / "Parts.3dshapes"
         d.mkdir(parents=True)
@@ -342,6 +380,26 @@ class CustomLayout(unittest.TestCase):
         self.assertEqual(rep["fixable"][0]["fix"], "${ACME_KICAD_LIB}/models/TVS24A.stp")
         lib3d.apply_fixes(self.cfg, rep["fixable"])
         self.assertEqual(lib3d.check_library(self.cfg)["counts"], {"ok": 1})
+
+    def test_category_whose_name_lacks_the_prefix_is_checked(self):
+        # A category may name its library anything (name = "legacy_logic"); its
+        # footprints are category footprints all the same, and the CI gate must see them.
+        cfg = libcfg.LibraryConfig(self.root, library_prefix="acme_", symbol_dir="symbols",
+                                   footprint_dir="footprints", model_dir="models",
+                                   library_mount="${ACME_KICAD_LIB}",
+                                   categories=["ics", {"key": "logic", "name": "legacy_logic"}])
+        pretty = self.root / "footprints" / "legacy_logic.pretty"
+        pretty.mkdir()
+        lib3d.write_text(pretty / "SOD.kicad_mod", H.FP_SAMACSYS.format(name="SOD", model="TVS24A.stp"))
+        self.assertIn(pretty, lib3d.footprint_dirs(cfg))
+        rep = lib3d.check_library(cfg)
+        self.assertEqual(rep["footprints"], 1)
+        self.assertEqual(rep["counts"], {"bare": 1})
+        self.assertEqual(rep["fixable"][0]["footprint"], "footprints/legacy_logic.pretty/SOD.kicad_mod")
+        # A category library that carries the prefix is listed once, not twice.
+        dirs = lib3d.footprint_dirs(libcfg.LibraryConfig(self.root, library_prefix="acme_",
+                                                         footprint_dir="footprints", categories=["protection"]))
+        self.assertEqual(dirs, sorted(d for d in (self.root / "footprints").glob("acme_*.pretty")))
 
 
 if __name__ == "__main__":

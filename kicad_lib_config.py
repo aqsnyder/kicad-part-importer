@@ -462,11 +462,15 @@ def resolve_config(cli: Optional[Mapping[str, Any]] = None, environ: Optional[Ma
 # ------------------------------------------------------------ starter config
 
 def infer_categories(library_root, symbol_dir=DEFAULT_SYMBOL_DIR, footprint_dir=DEFAULT_FOOTPRINT_DIR,
-                     library_prefix=DEFAULT_LIBRARY_PREFIX) -> List[Dict[str, str]]:
+                     library_prefix=DEFAULT_LIBRARY_PREFIX, known=()) -> List[Dict[str, str]]:
     """Categories for an existing library: one per ``<prefix>*.kicad_sym`` in the
-    symbol folder or ``<prefix>*.pretty`` in the footprint folder, sorted by
-    name. A library name whose remainder is not a valid key keeps its name
-    under a made-up key (``acme_74xx`` -> key ``c_74xx``, name ``acme_74xx``)."""
+    symbol folder or ``<prefix>*.pretty`` in the footprint folder.
+
+    A library that is one of the ``known`` categories (:class:`Category`, e.g.
+    the configured or default ones) keeps that category's key, description and
+    menu order; the other libraries follow, sorted by name. A library name
+    whose remainder is not a valid key keeps its name under a made-up key
+    (``acme_74xx`` -> key ``c_74xx``, name ``acme_74xx``)."""
     root = Path(library_root)
     names = set()
     for folder, suffix in ((root / symbol_dir, ".kicad_sym"), (root / footprint_dir, ".pretty")):
@@ -477,6 +481,16 @@ def infer_categories(library_root, symbol_dir=DEFAULT_SYMBOL_DIR, footprint_dir=
                 if (suffix == ".pretty") == p.is_dir():
                     names.add(p.name[:-len(suffix)])
     out, keys = [], set()
+    for cat in known:
+        if cat.name in names and cat.key not in keys:
+            d = {"key": cat.key}
+            if cat.description:
+                d["description"] = cat.description
+            if cat.name != library_prefix + cat.key:
+                d["name"] = cat.name
+            out.append(d)
+            keys.add(cat.key)
+            names.discard(cat.name)
     for name in sorted(names, key=str.lower):
         rest = name[len(library_prefix):]
         if rest and _KEY_RE.match(rest) and rest not in keys:
@@ -604,10 +618,12 @@ def starter_config(cfg: LibraryConfig, explicit=(), fmt="toml", version=None) ->
         "# Default: the folder that holds this library.",
         commented("project_dir", _toml_str(project_rel)),
         "",
-        "# Git. git_commit = true commits after every command that writes (as if",
-        "# --commit were given); git_push = true runs git push afterwards (as if",
-        "# --push). --no-commit / --no-push override them for one run. --dry-run",
-        "# and --check-3d never commit or push.",
+        "# Git. git_commit = true commits the library files every command writes",
+        "# (as if --commit were given); git_push = true runs git push afterwards",
+        "# (as if --push). --no-commit / --no-push override them for one run.",
+        "# --dry-run and --check-3d never commit or push, project files (the",
+        "# tables --add-to-project edits) are never committed, and --init commits",
+        "# or pushes only with --commit / --push on its command line.",
         "git_commit = %s" % ("true" if cfg.git_commit else "false"),
         "git_push = %s" % ("true" if cfg.git_push else "false"),
         "# Put in front of every commit message the tool writes, e.g. \"parts: \".",

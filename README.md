@@ -62,12 +62,14 @@ private library and private naming conventions.
   are all settings.
 - **Project integration and migration**: `--add-to-project` adds the
   category libraries to a project's `sym-lib-table` / `fp-lib-table`.
-  `--migrate` and `--migrate-schematic` move parts in from older libraries
+  `--migrate` and `--migrate-schematic` copy parts in from older libraries
   and schematics.
 - **Built for scripts and agents**: `--json` prints one report on stdout,
-  with exit codes 0 ok, 1 failed, 2 usage, 3 refused. Standard library only
-  (plus `tomli` on Python < 3.11). Runs on Linux, macOS and Windows (CI
-  tests Linux and Windows).
+  usage errors included, with exit codes 0 ok, 1 failed, 2 usage, 3 refused.
+  An import with `--category` and `--yes` asks nothing; a command that
+  prompts stops with exit code 2 when stdin is closed, instead of crashing.
+  Standard library only (plus `tomli` on Python < 3.11). Runs on Linux,
+  macOS and Windows (CI tests Linux and Windows).
 
 ## How it works
 
@@ -186,7 +188,7 @@ kicad-part-importer --init --library-prefix acme_ --model-dir models \
 # Work on a library from outside it
 kicad-part-importer --library ~/kicad/my_board/my_kicad_library --check-3d
 
-# Move the custom parts a schematic uses into the categories
+# Copy the custom parts a schematic uses into the categories (and point it at the copies)
 kicad-part-importer --migrate-schematic ../power.kicad_sch
 
 # Show the effective settings and where they came from
@@ -248,19 +250,26 @@ Every flag and environment variable: [docs/cli.md](docs/cli.md).
 
 ## Git
 
-`--commit` commits after the work. A planned import commits exactly the files
-it wrote; the other commands that write (`--init`, `--init-libraries`,
-`--migrate`, `--migrate-schematic`, `--add-to-project`, the interactive
-import) stage everything under the library root (`git add .`). `--push` runs
-`git push` afterwards. The library's config file can turn both on
-(`git_commit`, `git_push`) and set a commit-message prefix.
-`--no-commit` / `--no-push` turn them off for one run.
+`--commit` commits the library files the command wrote, and nothing else:
+`git add -- <files>` and `git commit -- <files>`, so whatever else you have
+staged stays out of the tool's commit. A command that changed no library file
+commits nothing. A file git ignores (a model folder in `.gitignore`, say) is
+left out and named (`⚠ Not committed (git ignores them): ...`), and the other
+files are committed. `--push` runs `git push` afterwards. The library's config
+file can turn both on (`git_commit`, `git_push`) and set a commit-message
+prefix. `--no-commit` / `--no-push` turn them off for one run. A requested
+commit or push that fails makes the run fail (exit code 1).
 
 The tool never runs `git push` unless `--push` or `git_push = true` asks for
 it. A `--dry-run` never commits or pushes, and neither does a refused
 import. **`--commit` and `--push` do not apply to `--check-3d`**: it never
 commits or pushes, even with `--fix-3d`, so review and commit its fixes
-yourself.
+yourself. Files the tool changes in a project (the `sym-lib-table` /
+`fp-lib-table` that `--add-to-project` edits, the schematic
+`--migrate-schematic` rewrites) are never committed either; commit them in
+the project. `--init` commits and pushes only with `--commit` / `--push` on
+its own command line, never because of `git_commit` / `git_push` in a
+template or the environment.
 
 ## Limitations and known issues
 
@@ -271,7 +280,9 @@ yourself.
   model. The planned run refuses conflicts and takes only model file
   extensions.
 - `--add-to-project`, `--migrate` and `--migrate-schematic` always ask
-  questions, so they cannot run with `--yes` / `--dry-run` / `--json`.
+  questions, so they cannot run with `--yes` / `--dry-run` / `--json`. A
+  prompt that gets no answer (stdin closed, or Ctrl+C) stops the run with
+  exit code 2.
 - **Symbol Footprint fields are not rewritten.** The plan warns when a
   vendor's field does not name the category library; set it in KiCad's
   Symbol Editor.

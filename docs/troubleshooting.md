@@ -128,6 +128,18 @@ The categories come from the library's config file. `--show-config` lists
 them. Add one by adding a `[[categories]]` table, then run `--init` again to
 create its empty libraries.
 
+### `cannot read zip`
+
+```text
+$ kicad-part-importer ~/Downloads/LIB_DEMOCAP_PART.zip --category passives --yes
+✗ cannot read zip: File is not a zip file
+```
+
+Exit code 2, before anything is written, with or without prompts. The file
+is not a zip archive, or not a whole one: a download that was cut short, or
+a web page saved under a `.zip` name. A zip with a damaged file in it says
+`Bad CRC-32 for file '...'` instead. Download the part again.
+
 ### Refused, nothing written (exit code 3)
 
 ```text
@@ -165,6 +177,48 @@ $ kicad-part-importer --migrate --yes
 `--add-to-project`, `--migrate` and `--migrate-schematic` ask which category
 or library to use, so they cannot run without prompts.
 
+### No answer at the prompt (stdin closed)
+
+```text
+$ kicad-part-importer ~/Downloads/LIB_DEMOCAP.zip < /dev/null 2>&1 | tail -n 2
+Enter your choice (0-13):
+✗ No answer at the prompt (stdin closed); stopped. Pass --category (one of: connectors, passives, semiconductors_discretes, ics_general, power_management, mcus_soc, memory_storage, rf_communication, sensors, optoelectronics_displays, electromechanical, protection, mechanicals_misc) and --yes to import without prompts.
+```
+
+Exit code 2. The command asked a question and got no answer: it ran from a
+script, CI or an agent with no terminal, or you pressed Ctrl+C. Nothing was
+written after that point. For an import, give the category on the command
+line. `--add-to-project` and the migration commands have no flag for their
+answers; run them in a terminal. With no answer to "Delete the zip file?"
+the import itself is done and the zip is kept.
+
+### A non-UTF-8 file in a vendor zip
+
+```text
+$ kicad-part-importer ~/Downloads/LIB_DEMOCAP_CP1252.zip --category passives --yes
+Plan: LIB_DEMOCAP_CP1252.zip -> passives (lib_passives)
+  footprint  CAP_DEMO               add       lib_fp/lib_passives.pretty/CAP_DEMO.kicad_mod
+  3D model   DEMOCAP.stp            add       3d_models/DEMOCAP.stp
+✗ DEMOCAP/KiCad/DEMOCAP.kicad_sym is not UTF-8 text (byte 0xb5 at position 267); KiCad files are UTF-8: save it as UTF-8 and try again
+Nothing written.
+```
+
+Exit code 3. KiCad writes UTF-8; this file was saved in another encoding
+(here Windows-1252, where `µ` is the byte `0xb5`). Unpack the zip, open the
+file in an editor, save it as UTF-8, zip it again and import that.
+
+The same error can name a symbol library of the library itself:
+
+```text
+$ kicad-part-importer ~/Downloads/LIB_DEMOTVS5.zip --category protection --yes | tail -n 2
+✗ lib_sym/lib_passives.kicad_sym is not UTF-8 text (byte 0xb5 at position 266); KiCad files are UTF-8: save it as UTF-8 and try again
+Nothing written.
+```
+
+The plan reads the symbol names of every category (to refuse a duplicate,
+and to warn about a name another category has), so such a file stops every
+planned import, whatever its category. Save it as UTF-8 in an editor.
+
 ### `--fix-3d` alone
 
 ```text
@@ -184,6 +238,75 @@ The plan warned about it:
 
 Set the symbol's Footprint field to the given value in the Symbol Editor.
 The tool leaves symbol fields as the vendor wrote them.
+
+## Projects, migration and git
+
+### Project library tables not found
+
+```text
+$ kicad-part-importer --add-to-project
+Updating project library settings...
+✗ Project library tables not found: /tmp/demo/kicad/my_board needs both sym-lib-table and fp-lib-table (KiCad writes them; see docs/kicad-integration.md)
+```
+
+Exit code 1. The project folder (`project_dir`, by default the folder that
+holds the library) has no `sym-lib-table` / `fp-lib-table` yet. Let KiCad
+create them, or create them by hand
+([kicad-integration.md](kicad-integration.md#project-library-tables)), or
+point `--project-dir` at the right folder.
+
+### `--commit does not apply to --add-to-project`
+
+```text
+$ kicad-part-importer --add-to-project --commit
+⚠ --commit does not apply to --add-to-project: the tables are project files; commit them in the project
+Updating project library settings...
+...
+✓ Updated project library settings
+```
+
+The tables belong to the project, often a different repository than the
+library, so the tool leaves them for you to commit there. The same holds
+for the schematic `--migrate-schematic` rewrites: `--commit` commits the
+symbols and footprints it copied into the library, not the schematic.
+
+### Not committed (git ignores them)
+
+```text
+$ kicad-part-importer ~/Downloads/LIB_DEMOTVS5.zip --category protection --link-3d --yes --commit | grep -i committed
+⚠ Not committed (git ignores them): 3d_models/DEMOTVS5.stp
+✓ Committed 2 file(s): Add components from LIB_DEMOTVS5.zip
+```
+
+Exit code 0. The repository ignores the model folder (here the project's
+`.gitignore` lists `my_kicad_library/3d_models/`), and `git add` refuses an
+ignored file, so the tool commits the symbol and the footprint and leaves
+the model out. The model is written all the same. If the models belong in
+the repository, remove the folder from `.gitignore` and commit them. With
+`--json`, the report's `warnings` names the files too.
+
+### A symbol is not migrated again
+
+```text
+$ kicad-part-importer --migrate old_parts.kicad_sym | tail -n 6
+
+============================================================
+Migration Complete
+============================================================
+✓ Migrated 0 symbol(s)
+✗ 1 symbol(s) or footprint(s) not copied (see above)
+```
+
+Exit code 1. Above the summary the run says
+`⚠ OLDREG already exists in lib_power_management; not copied again (remove
+or rename one of them first)`. A symbol library cannot hold two symbols of
+one name, so `--migrate` and `--migrate-schematic` never append a second
+one. After `--migrate`, if the symbol in the category is the one you want,
+there is nothing to do. `--migrate-schematic` also leaves that part's
+references in the schematic as they were, so the schematic still uses the
+old library: point those parts at the category's symbol in KiCad's
+Schematic Editor (the *Change Symbols* dialog sets a symbol's library link),
+or remove the symbol from the category and run the migration again.
 
 ## 3D models and KiCad
 
@@ -224,6 +347,18 @@ Here it is a bare file name. `kicad-part-importer --check-3d --fix-3d --yes`
 rewrites it when the file is in the library. See
 [3d-models.md](3d-models.md#proving-it-in-kicad---verify-3d).
 
+### `KiCad could not load` from `--verify-3d`
+
+```text
+✗ KiCad could not load SOD_BROKEN.kicad_mod: FootprintLoad returned None
+3D check: 1 loaded, 0 with a model that did not load, 0 without a model, 1 that KiCad could not load (KiCad 10.0.7)
+```
+
+Exit code 1, even when every model path is fine. KiCad's `pcbnew` could not
+read the footprint file at all (a syntax error, an unknown token, a format
+newer than your KiCad), so its model could not be checked either. Open it in
+the Footprint Editor, fix or re-save it, and run the check again.
+
 ### `--check-3d` is clean but KiCad shows no body
 
 - **Footprint Editor without a project.** `${KIPRJMOD}` is only defined while
@@ -241,7 +376,9 @@ rewrites it when the file is in the library. See
 ### Works on Windows, fails on Linux
 
 Linux file names are case-sensitive. `--check-3d` reports such paths as
-`case` and `--fix-3d` rewrites them to the real spelling.
+`case`, whether the file name or a folder in the path is spelled with other
+letter case (`3D_Models/X.step` for `3d_models/X.step`), and `--fix-3d`
+rewrites them to the real spelling.
 
 ## Platform notes
 
@@ -250,8 +387,10 @@ Linux file names are case-sensitive. `--check-3d` reports such paths as
   crashing. Set `PYTHONIOENCODING=utf-8`, or use Windows Terminal, to see
   them.
 - **Line endings.** Footprints and symbol libraries keep their line endings
-  (vendor files are often CRLF). Library tables keep theirs too. Config files
-  written by `--init` use LF.
+  (vendor files are often CRLF). Library tables and the schematics
+  `--migrate-schematic` rewrites keep theirs too, and a footprint it copies
+  keeps its bytes. New symbol libraries and config files written by `--init`
+  use LF, as KiCad does, on every OS.
 - **Long paths on Windows.** A library several folders deep inside a long
   path can exceed the classic 260-character limit when KiCad or Python
   opens it. Enable long paths in Windows, or keep libraries closer to the
@@ -280,8 +419,10 @@ config file at any time. Changing its library *name* means renaming the
 tables and symbols' Footprint fields. The tool does not rename libraries.
 
 **Can I use it from a script or an agent?** Yes: `--yes` or `--dry-run`
-with `--json` never prompts, prints one JSON object on stdout, and uses the
-exit codes above ([cli.md](cli.md#the-json-report)).
+with `--json` never prompts, prints one JSON object on stdout (usage errors
+included), and uses the exit codes above ([cli.md](cli.md#the-json-report)).
+A command that does prompt stops with exit code 2 when stdin is closed,
+instead of waiting or crashing.
 
 **Where do I report a problem?** In the
 [issue tracker](https://github.com/aqsnyder/kicad-part-importer/issues).
