@@ -1,0 +1,64 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.9", "3.12"]
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      # The runners have no KiCad. Pointing KICAD_BIN at a folder that does not
+      # exist also hides any KiCad an image might gain later: the tests that need
+      # KiCad must skip cleanly, and everything else must pass without it.
+      KICAD_BIN: ${{ github.workspace }}/no-kicad-here
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the package with its test extras
+        run: python -m pip install ".[test]"
+
+      - name: Run the tests
+        run: python -m pytest -v -rs
+
+      - name: Check the installed console script
+        run: |
+          kicad-part-importer --version
+          kicad-part-importer --help
+
+  package:
+    name: build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install build
+          python -m build
+
+      - name: Install the wheel in a clean environment
+        run: |
+          python -m venv .wheel-env
+          .wheel-env/bin/pip install dist/*.whl
+          .wheel-env/bin/kicad-part-importer --version
