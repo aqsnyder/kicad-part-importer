@@ -16,7 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ubuntu-24.04, not ubuntu-latest: setup-python has no Python 3.9 build for
+        # the newer Ubuntu image that ubuntu-latest now points to.
+        os: [ubuntu-24.04, windows-latest]
         python-version: ["3.9", "3.12"]
     env:
       PYTHONDONTWRITEBYTECODE: "1"
