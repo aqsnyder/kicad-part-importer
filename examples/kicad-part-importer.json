@@ -1,0 +1,30 @@
+{
+  "library_prefix": "lib_",
+  "symbol_dir": "lib_sym",
+  "footprint_dir": "lib_fp",
+  "model_dir": "3d_models",
+  "model_search_dirs": [],
+  "git_commit": false,
+  "git_push": false,
+  "git_message_prefix": "",
+  "stock_symbol_libraries": [
+    "Device", "power", "Connector", "Connector_Generic", "Switch", "Transistor_FET", "Reference_Voltage",
+    "Analog_DAC", "Analog_ADC", "MCU_ST_STM32", "Interface_USB", "Timer", "Regulator_Linear",
+    "Regulator_Switching", "Logic", "Memory_Flash"
+  ],
+  "categories": [
+    {"key": "connectors", "description": "Connectors, headers, sockets, and interconnects"},
+    {"key": "passives", "description": "Resistors, capacitors, inductors, and other passive components"},
+    {"key": "semiconductors_discretes", "description": "Diodes, transistors, and other discrete semiconductors"},
+    {"key": "ics_general", "description": "General purpose integrated circuits"},
+    {"key": "power_management", "description": "Power management ICs, regulators, and converters"},
+    {"key": "mcus_soc", "description": "Microcontrollers, SoCs, and processors"},
+    {"key": "memory_storage", "description": "Memory devices, storage, and flash"},
+    {"key": "rf_communication", "description": "RF components, antennas, and communication modules"},
+    {"key": "sensors", "description": "Sensors, transducers, and measurement devices"},
+    {"key": "optoelectronics_displays", "description": "LEDs, displays, optocouplers, and optical components"},
+    {"key": "electromechanical", "description": "Switches, relays, motors, and electromechanical components"},
+    {"key": "protection", "description": "Protection devices, fuses, and ESD protection"},
+    {"key": "mechanicals_misc", "description": "Mechanical parts, hardware, and miscellaneous components"}
+  ]
+}

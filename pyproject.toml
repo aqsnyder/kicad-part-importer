@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kicad-part-importer"
+version = "0.1.0"
+description = "Import vendor part downloads (TI / Ultra Librarian, SamacSys, SnapEDA) into a categorized KiCad library and link every footprint to its 3D model."
+readme = "README.md"
+requires-python = ">=3.9"
+# SPDX license expression (PEP 639). It replaces the "License ::" trove
+# classifier, which setuptools >= 77 refuses next to a license expression.
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Aaron Snyder" }]
+keywords = [
+    "kicad", "eda", "pcb", "electronics", "footprint", "symbol", "3d-model", "step",
+    "component-library", "part-library", "ultra-librarian", "samacsys", "snapeda",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Manufacturing",
+    "Intended Audience :: Science/Research",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+    "Topic :: Utilities",
+]
+# Python 3.11+ reads TOML config files with the standard library; older
+# versions need tomli. Nothing else: the tool is standard library only.
+dependencies = ["tomli>=1.1; python_version < '3.11'"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "tomli>=1.1; python_version < '3.11'"]
+
+[project.urls]
+Homepage = "https://github.com/aqsnyder/kicad-part-importer"
+Repository = "https://github.com/aqsnyder/kicad-part-importer"
+Issues = "https://github.com/aqsnyder/kicad-part-importer/issues"
+Documentation = "https://github.com/aqsnyder/kicad-part-importer/tree/main/docs"
+Changelog = "https://github.com/aqsnyder/kicad-part-importer/blob/main/CHANGELOG.md"
+
+[project.scripts]
+kicad-part-importer = "kicad_part_importer:main"
+
+[tool.setuptools]
+py-modules = ["kicad_part_importer", "kicad_lib_3d", "kicad_lib_config", "kicad_lib_verify"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

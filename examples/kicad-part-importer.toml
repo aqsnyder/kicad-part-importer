@@ -1,0 +1,107 @@
+# kicad-part-importer configuration: every setting at its default.
+#
+# `kicad-part-importer --init` writes a file like this into a library for you.
+# To start from this one instead, copy it into the root of your KiCad library
+# as kicad-part-importer.toml and change what you need; settings you delete
+# keep their defaults. The tool finds the file by walking up from the current
+# directory (as git finds .git), so every command run inside the library uses
+# it. --config FILE or KICAD_PART_IMPORTER_CONFIG names another file instead.
+# Reading TOML needs Python 3.11+ or the tomli package (installed with the
+# tool on older Pythons); the .json example next to this file holds the same
+# settings. Every setting is described in docs/configuration.md.
+#
+# Paths are relative to this file. library_root is allowed only in a file
+# given with --config or KICAD_PART_IMPORTER_CONFIG; project_dir (where the
+# project's sym-lib-table / fp-lib-table live) is allowed anywhere, e.g.
+# project_dir = "../.." for a library at <project>/libs/<library>.
+
+# Category libraries are named <library_prefix><key>: lib_sym/<name>.kicad_sym
+# and lib_fp/<name>.pretty.
+library_prefix = "lib_"
+
+# Folders inside the library root.
+symbol_dir = "lib_sym"
+footprint_dir = "lib_fp"
+model_dir = "3d_models"
+
+# Extra folders (inside the library root) that --check-3d --fix-3d searches,
+# after model_dir, for a model a footprint names by another path.
+model_search_dirs = []
+
+# How projects reach the library root in footprint model paths. The default is
+# ${KIPRJMOD}/<path from the project folder to the library root>, where the
+# project folder defaults to the folder that holds the library root.
+# library_mount = "${KIPRJMOD}/my_kicad_library"
+
+# The model path --link-3d writes. Default: <library_mount>/<model_dir>.
+# model_prefix = "${KIPRJMOD}/my_kicad_library/3d_models"
+
+# Git. git_commit = true commits after every command that writes (as if
+# --commit were given); git_push = true runs git push afterwards (as if
+# --push). --no-commit / --no-push override them for one run. --dry-run and
+# --check-3d never commit or push.
+git_commit = false
+git_push = false
+# Put in front of every commit message the tool writes, e.g. "parts: ".
+git_message_prefix = ""
+
+# KiCad's own symbol libraries, which --migrate-schematic leaves alone.
+stock_symbol_libraries = [
+    "Device", "power", "Connector", "Connector_Generic", "Switch", "Transistor_FET", "Reference_Voltage",
+    "Analog_DAC", "Analog_ADC", "MCU_ST_STM32", "Interface_USB", "Timer", "Regulator_Linear",
+    "Regulator_Switching", "Logic", "Memory_Flash",
+]
+
+# The categories, in menu order. Each needs a key; description is optional;
+# name (the library name) defaults to <library_prefix><key>.
+[[categories]]
+key = "connectors"
+description = "Connectors, headers, sockets, and interconnects"
+
+[[categories]]
+key = "passives"
+description = "Resistors, capacitors, inductors, and other passive components"
+
+[[categories]]
+key = "semiconductors_discretes"
+description = "Diodes, transistors, and other discrete semiconductors"
+
+[[categories]]
+key = "ics_general"
+description = "General purpose integrated circuits"
+
+[[categories]]
+key = "power_management"
+description = "Power management ICs, regulators, and converters"
+
+[[categories]]
+key = "mcus_soc"
+description = "Microcontrollers, SoCs, and processors"
+
+[[categories]]
+key = "memory_storage"
+description = "Memory devices, storage, and flash"
+
+[[categories]]
+key = "rf_communication"
+description = "RF components, antennas, and communication modules"
+
+[[categories]]
+key = "sensors"
+description = "Sensors, transducers, and measurement devices"
+
+[[categories]]
+key = "optoelectronics_displays"
+description = "LEDs, displays, optocouplers, and optical components"
+
+[[categories]]
+key = "electromechanical"
+description = "Switches, relays, motors, and electromechanical components"
+
+[[categories]]
+key = "protection"
+description = "Protection devices, fuses, and ESD protection"
+
+[[categories]]
+key = "mechanicals_misc"
+description = "Mechanical parts, hardware, and miscellaneous components"

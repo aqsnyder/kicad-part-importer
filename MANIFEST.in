@@ -1,0 +1,5 @@
+# Files the source distribution carries besides the modules (the wheel holds only the modules).
+include CHANGELOG.md CONTRIBUTING.md
+recursive-include tests *.py
+recursive-include examples *.toml *.json
+recursive-include docs *.md *.png
