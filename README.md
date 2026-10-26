@@ -226,7 +226,7 @@ that config file, then the defaults. `--show-config` prints the result.
 | `library_mount` | `${KIPRJMOD}/<library folder>` | How projects reach the library, in model paths and table entries |
 | `model_prefix` | `<library_mount>/<model_dir>` | The path `--link-3d` writes |
 | `categories` | 13 general electronics categories | Keys, descriptions, library names, menu order |
-| `stock_symbol_libraries` | KiCad's common libraries | Left alone by `--migrate-schematic` |
+| `stock_symbol_libraries` | KiCad 10's most used libraries | Left alone by `--migrate-schematic`, with every library KiCad installs |
 | `git_commit` / `git_push` / `git_message_prefix` | `false` / `false` / `""` | Commit / push after every write, message prefix |
 
 A library in its own house style (`kicad-part-importer.toml` in the library

@@ -54,7 +54,7 @@ Changelog = "https://github.com/aqsnyder/kicad-part-importer/blob/main/CHANGELOG
 kicad-part-importer = "kicad_part_importer:main"
 
 [tool.setuptools]
-py-modules = ["kicad_part_importer", "kicad_lib_3d", "kicad_lib_config", "kicad_lib_verify"]
+py-modules = ["kicad_part_importer", "kicad_lib_3d", "kicad_lib_config", "kicad_lib_stock", "kicad_lib_verify"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

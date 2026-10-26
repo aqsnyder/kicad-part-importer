@@ -168,10 +168,18 @@ def snapeda_zip(path, part="TESTREG1-7"):
     return fp
 
 
+def _kicad_path_var(name):
+    """KiCad's settings folder and symbol folder variables (see kicad_lib_stock)."""
+    n = name.upper()
+    return n == "KICAD_CONFIG_HOME" or (n.startswith("KICAD") and n.endswith("_SYMBOL_DIR"))
+
+
 def clean_env(env_extra=None):
-    """This process's environment without kicad-part-importer settings, so a
-    developer's own KICAD_PART_IMPORTER_* variables cannot change a test."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("KICAD_PART_IMPORTER_")}
+    """This process's environment without kicad-part-importer settings or KiCad's
+    settings / symbol folder variables, so a developer's own variables cannot
+    change a test."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("KICAD_PART_IMPORTER_") and not _kicad_path_var(k)}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("PYTHONIOENCODING", None)
     if env_extra:
@@ -267,10 +275,33 @@ def schematic(parts, embedded_footprints=False):
 
 
 def lib_table(kind, entries):
-    """A sym-lib-table / fp-lib-table text with (name, uri) entries."""
+    """A sym-lib-table / fp-lib-table text with (name, uri) or (name, uri, type)
+    entries (type "KiCad" by default)."""
     head = "sym_lib_table" if kind == "sym" else "fp_lib_table"
-    rows = "".join('  (lib (name "%s")(type "KiCad")(uri "%s")(options "")(descr ""))\n' % e for e in entries)
+    rows = "".join('  (lib (name "%s")(type "%s")(uri "%s")(options "")(descr ""))\n'
+                   % (e[0], e[2] if len(e) > 2 else "KiCad", e[1]) for e in entries)
     return "(%s\n  (version 7)\n%s)\n" % (head, rows)
+
+
+def kicad_env(root, installed=(), global_libs=(), version="10.0"):
+    """A made-up KiCad under root, for kicad_lib_stock: a symbols folder holding
+    <name>.kicad_sym for each installed name, and a settings folder whose
+    <version>/sym-lib-table nests a default table (as KiCad 10 writes it) that
+    lists global_libs as ${KICAD10_SYMBOL_DIR}/<name>.kicad_sym. Returns the
+    variables that point the tool at it; with nothing installed they hide any
+    real KiCad."""
+    root = Path(root)
+    symbols = root / "kicad_symbols"
+    symbols.mkdir(parents=True, exist_ok=True)
+    for name in installed:
+        write_eol(symbols / (name + ".kicad_sym"), EMPTY_LIB)
+    config = root / "kicad_config"
+    (config / version).mkdir(parents=True, exist_ok=True)
+    if global_libs:
+        template = write_eol(root / "kicad_template" / "sym-lib-table",
+                             lib_table("sym", [(n, "${KICAD10_SYMBOL_DIR}/%s.kicad_sym" % n) for n in global_libs]))
+        write_eol(config / version / "sym-lib-table", lib_table("sym", [("KiCad", template.as_posix(), "Table")]))
+    return {"KICAD_CONFIG_HOME": str(config), "KICAD10_SYMBOL_DIR": str(symbols)}
 
 
 # --------------------------------------------------------------------- git

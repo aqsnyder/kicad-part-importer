@@ -246,9 +246,11 @@ git_commit = false
 git_push = false
 git_message_prefix = ""
 stock_symbol_libraries = [
-    "Device", "power", "Connector", "Connector_Generic", "Switch", "Transistor_FET",
-    "Reference_Voltage", "Analog_DAC", "Analog_ADC", "MCU_ST_STM32", "Interface_USB", "Timer",
-    "Regulator_Linear", "Regulator_Switching", "Logic", "Memory_Flash",
+    "Device", "power", "Connector", "Connector_Generic", "Switch", "Jumper", "Diode", "LED",
+    "Transistor_BJT", "Transistor_FET", "Reference_Voltage", "Analog_ADC", "Analog_DAC",
+    "Amplifier_Operational", "Interface_USB", "Timer", "Regulator_Linear", "Regulator_Switching",
+    "74xx", "74xGxx", "Memory_Flash", "Sensor_Humidity", "Sensor_Motion", "Sensor_Optical",
+    "Sensor_Temperature", "Mechanical",
 ]
 
 [[categories]]
@@ -305,11 +307,11 @@ Other migration helpers:
   for in `lib_fp/old_footprints.pretty` first). The originals stay where they
   are, and a symbol the category library already holds is not copied again.
 - `--migrate-schematic board.kicad_sch` finds the custom parts a schematic
-  uses (skipping KiCad's stock libraries and libraries that already carry
-  your prefix), copies them into the categories, and rewrites the
-  schematic's references to the parts it copied (it keeps a
-  `.kicad_sch.bak`). A part it could not copy keeps its references, its
-  Footprint field included.
+  uses (skipping KiCad's own libraries, the ones `stock_symbol_libraries`
+  names, and libraries that already carry your prefix), copies them into
+  the categories, and rewrites the schematic's references to the parts it
+  copied (it keeps a `.kicad_sch.bak`). A part it could not copy keeps its
+  references, its Footprint field included.
 - `--add-to-project` adds the categories to each project's tables, through
   the mount.
 

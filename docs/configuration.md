@@ -121,7 +121,7 @@ config file it read (`config_file`) and how it found the library root
 | `library_mount` | `${VAR}` or `${VAR}/path` | `${KIPRJMOD}/<path from project_dir to the library root>` | `--library-mount` | `KICAD_PART_IMPORTER_LIBRARY_MOUNT` |
 | `model_prefix` | string | `<library_mount>/<model_dir>` | `--model-prefix` | `KICAD_PART_IMPORTER_MODEL_PREFIX` |
 | `categories` | list of keys or tables | the 13 below | (file only) | (file only) |
-| `stock_symbol_libraries` | list of strings | KiCad's common libraries (below) | (file only) | (file only) |
+| `stock_symbol_libraries` | list of strings | KiCad 10's most used libraries (below) | (file only) | (file only) |
 | `git_commit` | boolean | `false` | `--commit` / `--no-commit` | `KICAD_PART_IMPORTER_GIT_COMMIT` |
 | `git_push` | boolean | `false` | `--push` / `--no-push` | `KICAD_PART_IMPORTER_GIT_PUSH` |
 | `git_message_prefix` | string | `""` | (none) | `KICAD_PART_IMPORTER_GIT_MESSAGE_PREFIX` |
@@ -192,14 +192,44 @@ paths as `other-var` (or `absolute`).
 model_prefix = "${KIPRJMOD}/acme_kicad_library/packages3d"
 ```
 
-**`stock_symbol_libraries`**: library names `--migrate-schematic` leaves
-alone because they ship with KiCad. Default: `Device`, `power`, `Connector`,
-`Connector_Generic`, `Switch`, `Transistor_FET`, `Reference_Voltage`,
-`Analog_DAC`, `Analog_ADC`, `MCU_ST_STM32`, `Interface_USB`, `Timer`,
-`Regulator_Linear`, `Regulator_Switching`, `Logic`, `Memory_Flash`.
+**`stock_symbol_libraries`**: symbol libraries `--migrate-schematic` leaves
+alone. Whatever the list says, it also leaves alone KiCad's own libraries,
+which it finds on the computer:
+
+- a library the project's `sym-lib-table` lists with a path that starts with
+  `${KICAD10_SYMBOL_DIR}` (or `${KICAD9_SYMBOL_DIR}`, `${KICAD8_SYMBOL_DIR}`,
+  any `${KICADn_SYMBOL_DIR}`), or a path inside KiCad's symbols folder. The
+  project table decides: a project library called `Device` that points at
+  the project's own file is migrated like any other;
+- a library the project table does not list, when KiCad's global
+  `sym-lib-table` lists it that way (the default table that KiCad 10's
+  global table nests included), or when KiCad's symbols folder holds
+  `<name>.kicad_sym` (or a `<name>.kicad_symdir` folder).
+
+KiCad's symbols folder is the one `KICAD10_SYMBOL_DIR` (or another
+`KICADn_SYMBOL_DIR`) names, in the environment or in KiCad's *Configure
+Paths*, when that folder exists; otherwise KiCad's default install folder
+(`C:\Program Files\KiCad\<version>\share\kicad\symbols`,
+`/usr/share/kicad/symbols`,
+`/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols`, or a
+Flatpak's) or the one next to `kicad-cli` on `PATH`. The global table is
+read from KiCad's settings folder (`$KICAD_CONFIG_HOME`, else
+`%APPDATA%\kicad`, `~/.config/kicad` or `~/Library/Preferences/kicad`), every
+version, newest first.
+
+The list is for the rest: your own libraries whose parts a schematic should
+keep using, and KiCad's libraries on a computer where the tool finds no
+KiCad (a CI runner, say). A library on the list is left alone whatever the
+tables say. Setting the list replaces the default, which is KiCad 10's most
+used libraries (each also in KiCad 9): `Device`, `power`, `Connector`,
+`Connector_Generic`, `Switch`, `Jumper`, `Diode`, `LED`, `Transistor_BJT`,
+`Transistor_FET`, `Reference_Voltage`, `Analog_ADC`, `Analog_DAC`,
+`Amplifier_Operational`, `Interface_USB`, `Timer`, `Regulator_Linear`,
+`Regulator_Switching`, `74xx`, `74xGxx`, `Memory_Flash`, `Sensor_Humidity`,
+`Sensor_Motion`, `Sensor_Optical`, `Sensor_Temperature`, `Mechanical`.
 
 ```toml
-stock_symbol_libraries = ["Device", "power", "Connector", "Connector_Generic"]
+stock_symbol_libraries = ["Device", "power", "Connector", "Connector_Generic", "TeamShared"]
 ```
 
 ## Categories

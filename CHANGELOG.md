@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `--migrate-schematic` finds KiCad's own symbol libraries itself instead of
+  relying on a fixed list, so it no longer offers to copy (or reports as
+  missing from `sym-lib-table`) parts from stock libraries such as
+  `Sensor_Humidity` or `74xGxx`. A library is stock when the project's
+  `sym-lib-table` points it into KiCad's symbol folder
+  (`${KICAD10_SYMBOL_DIR}`, `${KICAD9_SYMBOL_DIR}`, any
+  `${KICADn_SYMBOL_DIR}`, or a path inside the installed symbols folder).
+  When the project table does not list it, KiCad's global `sym-lib-table`
+  decides, with the default table that KiCad 10's global table nests. So
+  does a `.kicad_sym` or `.kicad_symdir` of that name in KiCad's installed
+  symbols folder. A project library that only shares a stock library's name
+  is still migrated. The run names the stock libraries it leaves alone. The
+  new module is `kicad_lib_stock.py`.
+- `stock_symbol_libraries` is now an explicit addition to that detection,
+  for your own libraries and for a computer with no KiCad. Its default
+  (written by `--init`) holds real KiCad 10 names: `MCU_ST_STM32` and
+  `Logic` (no such libraries in KiCad 10) are gone; `74xx`, `74xGxx`,
+  `Sensor_Humidity`, `Sensor_Optical`, `Sensor_Motion`,
+  `Sensor_Temperature`, `Jumper`, `Diode`, `LED`, `Transistor_BJT`,
+  `Amplifier_Operational` and `Mechanical` are added. Config files that
+  0.1.0's `--init` wrote keep the old list, which is harmless where KiCad is
+  found.
+
 ## [0.1.0] - 2026-10-25
 
 Initial public release.

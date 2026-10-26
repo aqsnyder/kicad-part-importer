@@ -35,9 +35,10 @@ well and keeps the tool in its own environment. On Python 3.9 and 3.10 the
 install pulls in `tomli` to read TOML config files. Nothing else is
 installed.
 
-You can also run the tool without installing it. The four modules
-(`kicad_part_importer.py`, `kicad_lib_3d.py`, `kicad_lib_config.py` and
-`kicad_lib_verify.py`) must stay together in one folder:
+You can also run the tool without installing it. The five modules
+(`kicad_part_importer.py`, `kicad_lib_3d.py`, `kicad_lib_config.py`,
+`kicad_lib_stock.py` and `kicad_lib_verify.py`) must stay together in one
+folder:
 
 ```bash
 python path/to/kicad_part_importer.py --version

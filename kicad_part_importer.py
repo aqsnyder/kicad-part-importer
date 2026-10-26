@@ -63,6 +63,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import kicad_lib_3d as lib3d  # noqa: E402
 import kicad_lib_config as libcfg  # noqa: E402
+import kicad_lib_stock as libstock  # noqa: E402
 
 __version__ = "0.1.0"
 
@@ -199,11 +200,13 @@ def _guard_console_encoding():
 class LibraryManager:
     """Manages a categorized KiCad library: imports, 3D models, project tables, git."""
 
-    def __init__(self, base_path: str = None, config: Optional[libcfg.LibraryConfig] = None):
+    def __init__(self, base_path: str = None, config: Optional[libcfg.LibraryConfig] = None,
+                 stock: Optional[libstock.StockSymbolLibraries] = None):
         """Initialize the library manager with a library root, or a full configuration.
 
         base_path alone uses the default layout and naming for that root (the
-        current directory when neither is given)."""
+        current directory when neither is given). stock decides which symbol
+        libraries are KiCad's own (default: detected on first use)."""
         if config is None:
             config = libcfg.LibraryConfig(base_path if base_path is not None else Path.cwd())
         elif base_path is not None and Path(base_path).resolve() != Path(config.library_root).resolve():
@@ -224,6 +227,7 @@ class LibraryManager:
         self.written = set()
         self.project_written = set()
         self.git_ignored = []  # of the last commit's paths, those git ignores (left out of it)
+        self._stock = stock  # see stock_libraries()
 
     def _record_write(self, path, project=False) -> None:
         (self.project_written if project else self.written).add(Path(os.path.abspath(str(path))))
@@ -1222,15 +1226,24 @@ class LibraryManager:
             print(f"Error reading footprint from {fp_lib_path}: {e}")
             return None
 
-    def custom_schematic_components(self, components: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def stock_libraries(self) -> libstock.StockSymbolLibraries:
+        """KiCad's own symbol libraries: stock_symbol_libraries plus the ones this
+        computer's KiCad installs (see kicad_lib_stock). Found on first use."""
+        if self._stock is None:
+            self._stock = libstock.StockSymbolLibraries.detect(self.config.stock_symbol_libraries)
+        return self._stock
+
+    def custom_schematic_components(self, components: List[Dict[str, str]],
+                                    sym_lib_map: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
         """The components a schematic migration considers: not from a stock KiCad
-        library, and not already in a category library (by name or prefix)."""
-        standard_libs = set(self.config.stock_symbol_libraries)
+        library (sym_lib_map is the project's sym-lib-table, {name: uri}), and not
+        already in a category library (by name or prefix)."""
+        stock = self.stock_libraries()
         category_names = {lib_info['sym_file'].replace('.kicad_sym', '') for lib_info in self.libraries.values()}
         prefix = self.config.library_prefix
         return [
             c for c in components
-            if c['lib_name'] not in standard_libs
+            if not stock.is_stock(c['lib_name'], sym_lib_map)
             and c['lib_name'] not in category_names
             and not (prefix and c['lib_name'].startswith(prefix))  # any library with the category prefix
         ]
@@ -1295,9 +1308,13 @@ class LibraryManager:
 
             print(f"  Found {len(components)} unique symbol references")
 
-            # Filter out standard KiCad libraries (Device, power, Connector, etc.)
+            # Filter out KiCad's own libraries (Device, power, Sensor_Humidity, ...)
             # and components already in a category library
-            custom_components = self.custom_schematic_components(components)
+            custom_components = self.custom_schematic_components(components, sym_lib_map)
+            stock_names = sorted({c['lib_name'] for c in components
+                                  if self.stock_libraries().is_stock(c['lib_name'], sym_lib_map)}, key=str.lower)
+            if stock_names:
+                print(f"  Leaving alone the parts from stock libraries: {', '.join(stock_names)}")
 
             if not custom_components:
                 print("  No custom components found to migrate (all are either standard KiCad or already in a category library).")

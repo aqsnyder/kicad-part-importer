@@ -47,11 +47,16 @@ git_push = false
 # Put in front of every commit message the tool writes, e.g. "parts: ".
 git_message_prefix = ""
 
-# KiCad's own symbol libraries, which --migrate-schematic leaves alone.
+# Symbol libraries --migrate-schematic leaves alone. It also leaves alone
+# every library KiCad installs (${KICADn_SYMBOL_DIR} in sym-lib-table, or a
+# .kicad_sym in KiCad's symbols folder); this list is for the rest, and for
+# a computer where it finds no KiCad.
 stock_symbol_libraries = [
-    "Device", "power", "Connector", "Connector_Generic", "Switch", "Transistor_FET", "Reference_Voltage",
-    "Analog_DAC", "Analog_ADC", "MCU_ST_STM32", "Interface_USB", "Timer", "Regulator_Linear",
-    "Regulator_Switching", "Logic", "Memory_Flash",
+    "Device", "power", "Connector", "Connector_Generic", "Switch", "Jumper", "Diode", "LED",
+    "Transistor_BJT", "Transistor_FET", "Reference_Voltage", "Analog_ADC", "Analog_DAC",
+    "Amplifier_Operational", "Interface_USB", "Timer", "Regulator_Linear", "Regulator_Switching",
+    "74xx", "74xGxx", "Memory_Flash", "Sensor_Humidity", "Sensor_Motion", "Sensor_Optical",
+    "Sensor_Temperature", "Mechanical",
 ]
 
 # The categories, in menu order. Each needs a key; description is optional;
