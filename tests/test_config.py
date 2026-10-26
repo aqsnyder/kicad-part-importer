@@ -10,6 +10,7 @@ from pathlib import Path
 import libtest_helpers as H
 import kicad_lib_3d as lib3d
 import kicad_lib_config as libcfg
+import kicad_lib_stock as libstock
 import kicad_part_importer as kpi
 
 try:
@@ -416,20 +417,34 @@ class SchematicFilter(ScratchDirCase):
     def components(self, *lib_names):
         return [{"lib_id": n + ":X", "lib_name": n, "sym_name": "X", "footprint": ""} for n in lib_names]
 
+    def manager(self, **settings):
+        """A LibraryManager that sees no KiCad: only the configured list is stock."""
+        cfg = libcfg.LibraryConfig(self.t, **settings)
+        return kpi.LibraryManager(config=cfg, stock=libstock.StockSymbolLibraries(cfg.stock_symbol_libraries))
+
     def test_prefix_and_stock_libraries_are_left_alone(self):
-        m = kpi.LibraryManager(self.t)
+        m = self.manager()
         kept = m.custom_schematic_components(self.components("Device", "lib_passives", "lib_other", "MyParts"))
         self.assertEqual([c["lib_name"] for c in kept], ["MyParts"])
 
     def test_empty_prefix_does_not_hide_everything(self):
-        m = kpi.LibraryManager(config=libcfg.LibraryConfig(self.t, library_prefix=""))
+        m = self.manager(library_prefix="")
         kept = m.custom_schematic_components(self.components("Device", "passives", "MyParts"))
         self.assertEqual([c["lib_name"] for c in kept], ["MyParts"])
 
     def test_stock_libraries_are_configurable(self):
-        m = kpi.LibraryManager(config=libcfg.LibraryConfig(self.t, stock_symbol_libraries=["MyParts"]))
+        m = self.manager(stock_symbol_libraries=["MyParts"])
         kept = m.custom_schematic_components(self.components("Device", "MyParts"))
         self.assertEqual([c["lib_name"] for c in kept], ["Device"])
+
+    def test_kicad_libraries_are_left_alone_without_the_list(self):
+        installed = self.t / "symbols"
+        H.write_eol(installed / "Sensor_Humidity.kicad_sym", H.EMPTY_LIB)
+        m = kpi.LibraryManager(config=libcfg.LibraryConfig(self.t, stock_symbol_libraries=[]),
+                               stock=libstock.StockSymbolLibraries(symbol_dirs=[installed]))
+        table = {"74xGxx": "${KICAD10_SYMBOL_DIR}/74xGxx.kicad_sym", "Mine": "${KIPRJMOD}/Mine.kicad_sym"}
+        kept = m.custom_schematic_components(self.components("Sensor_Humidity", "74xGxx", "Mine", "Ghost"), table)
+        self.assertEqual([c["lib_name"] for c in kept], ["Mine", "Ghost"])
 
 
 class Packaging(unittest.TestCase):

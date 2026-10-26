@@ -213,7 +213,10 @@ later placement then picks the right footprint automatically.
 parts come from old project libraries, it copies the parts it can find into
 the categories and rewrites the schematic's `lib_id` and Footprint
 references of the parts it copied to the category libraries, after saving a
-`.kicad_sch.bak`. A part whose symbol it could not read (its library is not
+`.kicad_sch.bak`. Parts from KiCad's own libraries (`Device`,
+`Sensor_Humidity`, `74xGxx` and the rest) stay as they are; see
+[`stock_symbol_libraries`](configuration.md#settings-reference) for how it
+tells them apart. A part whose symbol it could not read (its library is not
 in `sym-lib-table`, say), or whose name the category already has, keeps its
 references, its Footprint field included, even when it uses the same
 footprint as a part that was copied; a footprint it could not copy keeps

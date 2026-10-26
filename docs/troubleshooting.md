@@ -308,6 +308,30 @@ old library: point those parts at the category's symbol in KiCad's
 Schematic Editor (the *Change Symbols* dialog sets a symbol's library link),
 or remove the symbol from the category and run the migration again.
 
+### A KiCad part is not left alone
+
+`--migrate-schematic` says which libraries it leaves alone:
+
+```text
+Extracting components from schematic...
+  Found 4 unique symbol references
+  Leaving alone the parts from stock libraries: 74xGxx, Device, Sensor_Humidity
+```
+
+A KiCad library missing from that line is offered for migration, or is
+reported as `Symbol library '<name>' not found in sym-lib-table`. The tool
+did not find it among KiCad's libraries: KiCad is installed somewhere it does
+not look, the project's `sym-lib-table` lists the library with a path of its
+own, or the computer has no KiCad. Set `KICAD10_SYMBOL_DIR` to KiCad's
+`symbols` folder, or add the name to `stock_symbol_libraries` in the config
+file; see [configuration.md](configuration.md#settings-reference) for where
+it looks. kicad-part-importer 0.1.0 knew KiCad's libraries only from that
+list, whose default named `MCU_ST_STM32` and `Logic` (no such libraries in
+KiCad 10) and left out `74xGxx`, the `Sensor_*` libraries, `Diode`, `LED`,
+`Jumper` and `Mechanical`. A config file `--init` wrote then still holds the
+old list. That is harmless now, but you can replace it with the new default
+(`examples/kicad-part-importer.toml`).
+
 ## 3D models and KiCad
 
 ### KiCad not found

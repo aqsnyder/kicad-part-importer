@@ -15,9 +15,10 @@ pip install -e ".[test]"
 kicad-part-importer --version
 ```
 
-The tool is four modules at the repository root: `kicad_part_importer.py`
+The tool is five modules at the repository root: `kicad_part_importer.py`
 (command line, imports, migration), `kicad_lib_config.py` (settings and
-discovery), `kicad_lib_3d.py` (model paths, checks, fixes, finding KiCad) and
+discovery), `kicad_lib_3d.py` (model paths, checks, fixes, finding KiCad),
+`kicad_lib_stock.py` (which symbol libraries are KiCad's own) and
 `kicad_lib_verify.py` (the script that runs under KiCad's Python for
 `--verify-3d`).
 

@@ -57,11 +57,14 @@ DEFAULT_CATEGORIES = (
     ("mechanicals_misc", "Mechanical parts, hardware, and miscellaneous components"),
 )
 
-# KiCad's own symbol libraries: --migrate-schematic leaves parts from these alone.
+# Symbol libraries --migrate-schematic leaves alone, on top of the KiCad libraries
+# it finds itself (kicad_lib_stock): KiCad 10's most used ones (each also in
+# KiCad 9), for a computer where it finds no KiCad.
 DEFAULT_STOCK_SYMBOL_LIBRARIES = (
-    "Device", "power", "Connector", "Connector_Generic", "Switch", "Transistor_FET", "Reference_Voltage",
-    "Analog_DAC", "Analog_ADC", "MCU_ST_STM32", "Interface_USB", "Timer", "Regulator_Linear",
-    "Regulator_Switching", "Logic", "Memory_Flash",
+    "Device", "power", "Connector", "Connector_Generic", "Switch", "Jumper", "Diode", "LED", "Transistor_BJT",
+    "Transistor_FET", "Reference_Voltage", "Analog_ADC", "Analog_DAC", "Amplifier_Operational", "Interface_USB",
+    "Timer", "Regulator_Linear", "Regulator_Switching", "74xx", "74xGxx", "Memory_Flash", "Sensor_Humidity",
+    "Sensor_Motion", "Sensor_Optical", "Sensor_Temperature", "Mechanical",
 )
 
 # Every setting, in the order --show-config prints them.
@@ -629,7 +632,10 @@ def starter_config(cfg: LibraryConfig, explicit=(), fmt="toml", version=None) ->
         "# Put in front of every commit message the tool writes, e.g. \"parts: \".",
         "git_message_prefix = %s" % _toml_str(cfg.git_message_prefix),
         "",
-        "# KiCad's own symbol libraries, which --migrate-schematic leaves alone.",
+        "# Symbol libraries --migrate-schematic leaves alone. It also leaves alone",
+        "# every library KiCad installs (${KICADn_SYMBOL_DIR} in sym-lib-table, or a",
+        "# .kicad_sym in KiCad's symbols folder); this list is for the rest, and for",
+        "# a computer where it finds no KiCad.",
         "stock_symbol_libraries = %s" % _toml_list(cfg.stock_symbol_libraries),
         "",
         "# The categories, in menu order. Each needs a key (letters, digits, _ and -,",
